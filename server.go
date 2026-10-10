@@ -638,8 +638,21 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	} else {
 		html = baseTag + "\n" + html
 	}
+	if isTrustedDesktopRequest(r) {
+		html = desktopIndex(html)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, html)
+}
+
+// desktopIndex marks the page for html.desktop CSS/JS and points remote
+// favicons and logos at the embedded copies so the app works offline.
+func desktopIndex(html string) string {
+	return strings.NewReplacer(
+		`<html lang="en"`, `<html class="desktop" lang="en"`,
+		`"https://px0.ai/favicon`, `"static/static/favicon`,
+		`"https://px0.ai/logo/`, `"static/static/logo/`,
+	).Replace(html)
 }
 
 // handleThemes joins web/themes/*.css into one stylesheet in file name order, so

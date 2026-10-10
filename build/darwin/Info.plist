@@ -23,6 +23,16 @@
         <string>true</string>
         <key>NSHumanReadableCopyright</key>
         <string>{{.Info.Copyright}}</string>
+        <key>NSDesktopFolderUsageDescription</key>
+        <string>px0 reads the folder you open, including folders in your Desktop folder.</string>
+        <key>NSDocumentsFolderUsageDescription</key>
+        <string>px0 reads the folder you open, including folders in your Documents folder.</string>
+        <key>NSDownloadsFolderUsageDescription</key>
+        <string>px0 reads the folder you open, including folders in your Downloads folder.</string>
+        <key>NSRemovableVolumesUsageDescription</key>
+        <string>px0 reads the folder you open, including folders on removable volumes.</string>
+        <key>NSNetworkVolumesUsageDescription</key>
+        <string>px0 reads the folder you open, including folders on network volumes.</string>
         {{if .Info.FileAssociations}}
         <key>CFBundleDocumentTypes</key>
         <array>

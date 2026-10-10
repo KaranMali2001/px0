@@ -15,7 +15,7 @@ Merge of upstream `master` at `02db0c7` into `desktop-parity` (base `6be8a06` + 
 | `Makefile` | Upstream targets plus desktop `desktop`, `dmg`, `install-cli`, `install-desktop`, `install-local`. `clean` does both: upstream's `web/app.js` reset and desktop's `build/bin/` removal. |
 | `README.md` | Upstream README; the "Native macOS app" section moved under Installation. |
 | `docs/internals/styling-and-themes.md` | Upstream text (localStorage `px0.theme`, default `catppuccin-mocha`), plus a note that the theme is mirrored to `workbench.colorTheme` in `settings.json`. |
-| `web/index.html` | Upstream head (Google Fonts, relative `static/` URLs) plus the desktop `wails:` protocol class script. Favicons and sidebar/splash logos point at the embedded `static/static/...` copies instead of `px0.ai`. |
+| `web/index.html` | Upstream head (Google Fonts, relative `static/` URLs) plus the desktop `wails:` protocol class script. Superseded: see "Shared-file decisions". |
 | `web/style.css` | Upstream rules, with upstream's 340px sidebar width. Desktop's removal of the `#side` background stays, so the translucent desktop material still shows. Font URLs are now `static/fonts/...`. |
 | `web/src/state.js` | Upstream `request()` (base-relative URLs, JSON bodies) plus desktop's non-JSON / non-2xx error handling. Desktop `apiPostJSON` was dropped in favour of upstream `apiPostJson`. `persistPreference` was re-added on top of it. |
 | `web/src/theme.js` | Upstream (localStorage + settings mirror, `theme:changed`). Desktop `chooseTheme` was dropped because upstream `setTheme` already persists to settings. |
@@ -35,6 +35,16 @@ Merge of upstream `master` at `02db0c7` into `desktop-parity` (base `6be8a06` + 
 - `workbench.sideBar.width` default moved from 228 to 340 (`settings.go`, `settings.js`, `settings_test.go`) to match upstream's sidebar CSS.
 - `web/static` is now embedded. In `b8e3012` the `/static/` handler served `web/`, so `/static/favicon.ico` and `/static/fonts/*` did not resolve to `web/static/*`. Assets are now served at `static/static/...` (relative, so `-base-path` works too).
 - Three upstream git tests (`TestPRReviewerChangesInIndex`, `TestGitStagedFilesStatAndDiff`, `TestDeletedFileHandling`) failed on macOS because `t.TempDir()` lives under the `/var` → `/private/var` symlink. They now resolve the temp dir the same way other tests in `git_test.go` already do.
+
+## Shared-file decisions (parity with 02db0c7)
+
+Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests marked by `trustedDesktopRequest` (set by the Wails `deskHandler`). It adds `class="desktop"` to `<html>`, so desktop-only CSS/JS keys off `html.desktop`. The CLI server serves `web/index.html` unchanged (`TestIndexDesktopMarkerOnlyForDesktopRequests`).
+
+| File | Change vs 02db0c7 | Decision | Reason |
+| --- | --- | --- | --- |
+| `web/index.html` | `wails:` class script; favicons/logos from `static/static/...` | Reverted to upstream; desktop rewrite moved to `desktopIndex` | Offline assets are desktop integration; CLI keeps upstream's remote URLs |
+| `server.go` | `web/static` embed, `trustedDesktopRequest`, `desktopIndex` | Keep (desktop-gated) | Only reachable from the Wails handler; the extra embedded files are unused by the CLI page |
+| `build/darwin/Info.plist`, `Info.dev.plist` | `NS{Desktop,Documents,Downloads}FolderUsageDescription`, `NS{Removable,Network}VolumesUsageDescription` | Added | macOS shows these when px0 reads a protected folder; bundle id unchanged |
 
 ## Desktop startup
 

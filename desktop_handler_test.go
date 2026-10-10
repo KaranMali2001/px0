@@ -1,8 +1,10 @@
 package main
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,5 +61,37 @@ func TestDeskHandlerWaitIsBounded(t *testing.T) {
 	}
 	if !h.timedOut.Load() {
 		t.Fatal("timedOut not recorded")
+	}
+}
+
+func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
+	srv := agentServer(t, t.TempDir(), "echo")
+	get := func(r *http.Request) string {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("index status = %d", rec.Code)
+		}
+		return rec.Body.String()
+	}
+	upstream, err := fs.ReadFile(assets, "web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cli := get(httptest.NewRequest(http.MethodGet, "/", nil))
+	if cli != string(upstream) {
+		t.Fatal("CLI index differs from web/index.html")
+	}
+	if strings.Contains(cli, `class="desktop"`) || strings.Contains(cli, "static/static/") {
+		t.Fatal("CLI index carries desktop markup")
+	}
+
+	desk := get(trustedDesktopRequest(httptest.NewRequest(http.MethodGet, "/", nil)))
+	if !strings.Contains(desk, `<html class="desktop" lang="en"`) {
+		t.Fatal("desktop index missing html.desktop marker")
+	}
+	if strings.Contains(desk, "https://px0.ai/favicon") || strings.Contains(desk, "https://px0.ai/logo/") {
+		t.Fatal("desktop index still loads remote favicons/logos")
 	}
 }
