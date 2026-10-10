@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +91,16 @@ func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 	desk := get(trustedDesktopRequest(httptest.NewRequest(http.MethodGet, "/", nil)))
 	if !strings.Contains(desk, `<html class="desktop" lang="en"`) {
 		t.Fatal("desktop index missing html.desktop marker")
+	}
+	for _, tag := range regexp.MustCompile(`<script\b[^>]*>`).FindAllString(desk, -1) {
+		if !strings.Contains(tag, "src=") {
+			t.Fatalf("desktop index has inline script %q; CSP script-src 'self' would block it", tag)
+		}
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, trustedDesktopRequest(httptest.NewRequest(http.MethodGet, "/", nil)))
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self';") {
+		t.Fatalf("desktop index CSP = %q", csp)
 	}
 	if strings.Contains(desk, "https://px0.ai/favicon") || strings.Contains(desk, "https://px0.ai/logo/") || strings.Contains(desk, "fonts.googleapis.com/css2") {
 		t.Fatal("desktop index still loads remote fonts/favicons/logos")

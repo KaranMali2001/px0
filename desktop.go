@@ -33,7 +33,15 @@ func (h *deskHandler) open(root string) {
 	rememberFolder(root)
 }
 
-var deskCtx context.Context
+// deskCtx is set in OnStartup and read from menu callbacks and goroutines.
+var deskCtx atomic.Pointer[context.Context]
+
+func desktopCtx() context.Context {
+	if p := deskCtx.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 func main() {
 	augmentPATH()
@@ -47,8 +55,8 @@ func main() {
 	}, h.open)
 	go func() {
 		<-h.ready
-		if h.timedOut.Load() && deskCtx != nil {
-			wruntime.WindowReload(deskCtx)
+		if ctx := desktopCtx(); h.timedOut.Load() && ctx != nil {
+			wruntime.WindowReload(ctx)
 		}
 	}()
 
@@ -66,13 +74,13 @@ func main() {
 			Appearance:           mac.DefaultAppearance,
 			WebviewIsTransparent: true,
 			WindowIsTranslucent:  true,
-			About:                &mac.AboutInfo{Title: "px0", Message: "Read-only code navigator"},
+			About:                &mac.AboutInfo{Title: "px0 " + version, Message: "Code navigator with agent editing"},
 		},
 		Menu:       buildMenu(h),
 		OnShutdown: func(context.Context) { h.shutdown() },
 		OnStartup: func(ctx context.Context) {
 			enableHighRefreshRate()
-			deskCtx = ctx
+			deskCtx.Store(&ctx)
 			go func() {
 				<-h.ready
 				// No folder from args or memory (first launch) must pick one;
@@ -101,15 +109,20 @@ func buildMenu(h *deskHandler) *menu.Menu {
 }
 
 func openFolderDialog(h *deskHandler) {
-	if deskCtx == nil {
+	ctx := desktopCtx()
+	if ctx == nil {
 		return
 	}
-	dir, err := wruntime.OpenDirectoryDialog(deskCtx, wruntime.OpenDialogOptions{Title: "Open Folder"})
+	dir, err := wruntime.OpenDirectoryDialog(ctx, wruntime.OpenDialogOptions{Title: "Open Folder"})
 	if err != nil || dir == "" {
 		return
 	}
-	h.open(dir)
-	wruntime.WindowReload(deskCtx)
+	root, _, _, err := resolveTarget(dir)
+	if err != nil {
+		return
+	}
+	h.open(root)
+	wruntime.WindowReload(ctx)
 }
 
 func startupRoot() (string, bool) {

@@ -1,6 +1,6 @@
 /* Wails titlebar is hidden-inset: clear the traffic lights and let the sidebar header drag the window. */
-html.desktop #side header.panel-head { padding-top: 36px; -webkit-app-region: drag; app-region: drag; }
-html.desktop #side header.panel-head :is(button, a, input) { -webkit-app-region: no-drag; app-region: no-drag; }
+html.desktop #side header.panel-head { padding-top: 36px; --wails-draggable: drag; }
+html.desktop #side header.panel-head :is(button, a, input) { --wails-draggable: no-drag; }
 
 /* Colours are never written in this file: every one is read through a token.
    Themes live in web/themes/<id>.css and are served joined as /static/themes.css.

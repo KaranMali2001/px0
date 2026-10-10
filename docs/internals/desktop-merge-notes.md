@@ -38,7 +38,7 @@ Merge of upstream `master` at `02db0c7` into `desktop-parity` (base `6be8a06` + 
 
 ## Shared-file decisions (parity with 02db0c7)
 
-Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests marked by `trustedDesktopRequest` (set by the Wails `deskHandler`). It adds `class="desktop"` to `<html>`, so desktop-only CSS/JS keys off `html.desktop`. The CLI server serves `web/index.html` unchanged (`TestIndexDesktopMarkerOnlyForDesktopRequests`).
+Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests marked by `trustedDesktopRequest` (set by the Wails `deskHandler`). It adds `class="desktop"` to `<html>`, so desktop-only CSS/JS keys off `html.desktop`. The CLI server serves `web/index.html` unchanged (`TestIndexDesktopMarkerOnlyForDesktopRequests`). The marker is a server-side attribute rewrite, not an inline script, so it works under the unchanged `script-src 'self'` CSP; the same test asserts the desktop page has no inline `<script>` and still carries that CSP.
 
 | File | Change vs 02db0c7 | Decision | Reason |
 | --- | --- | --- | --- |
@@ -47,7 +47,7 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 | `build/darwin/Info.plist`, `Info.dev.plist` | `NS{Desktop,Documents,Downloads}FolderUsageDescription`, `NS{Removable,Network}VolumesUsageDescription` | Added | macOS shows these when px0 reads a protected folder; bundle id unchanged |
 | `web/src/tree.js` | SVG file-type/folder icons, special filename kinds, select-after-open with `.loading` | Reverted to upstream | Shared appearance/behaviour, not desktop-specific |
 | `web/style.css` | Vendored `@font-face` rules | Moved to `web/static/fonts/fonts.css`; `desktopIndex` swaps the Google Fonts link for it | Offline fonts are desktop integration; CLI keeps upstream's Google Fonts |
-| `web/style.css` | Traffic-light inset and drag region on `#side header.panel-head`; `#main`/`#view-switches`/`#tabs` insets | Keep, under `html.desktop` | Wails hidden-inset titlebar |
+| `web/style.css` | Traffic-light inset and drag region on `#side header.panel-head` (Wails v2 `--wails-draggable: drag`/`no-drag`, not `app-region`, which WKWebView ignores); `#main`/`#view-switches`/`#tabs` insets | Keep, under `html.desktop` | Wails hidden-inset titlebar |
 | `web/style.css` | "Apple-native polish" (translucent status/sidebar, button press scale, modal transitions, tracking, reduced-motion/transparency), `.row { contain: content }`, tree icon/loading styles | Reverted to upstream | Shared appearance tweaks, not desktop integration |
 | `web/style.css` | `body.side-right` layout and its `html.desktop` insets | Reverted to upstream | Part of the sidebar-location setting below |
 | `settings.go`, `web/src/settings.js` | `workbench.sideBar.{location,width,visible}` settings | Reverted to upstream (`settings.go` byte-identical) | New shared settings, not desktop integration |
@@ -70,6 +70,8 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - `main()` (`desktop.go`) resolves and opens the startup workspace on a goroutine (`deskHandler.openAsync`), so `wails.Run` and the window never wait on `startupRoot`/`NewIndex`/`NewServer`/git work. The folder picker in `OnStartup` waits for that open to finish. A launch from a privacy-protected folder (e.g. `~/Desktop`) used to hang forever with no window because a child `git rev-parse` blocked before `wails.Run`.
 - `deskHandler` (`desktop_handler.go`) holds webview requests until that open finishes (capped by `deskOpenWait`, 30s), so the unchanged web UI boots against a ready server. If a request gives up, it gets the existing 503 `no workspace open` and the window reloads once the open completes.
 - Opening another folder swaps the active server (`deskHandler.install`) and closes the old one on a goroutine, so its git watcher, scavenger, LSP children, agent runs and thread turns stop. `OnShutdown` closes the active server (`deskHandler.shutdown`).
+- `File > Open Folder…` resolves the picked folder with `resolveTarget` (abs + `EvalSymlinks`) before opening and remembering it, matching CLI/startup roots. `deskCtx` is an `atomic.Pointer` because menu callbacks and the startup goroutines read it while `OnStartup` writes it.
+- The macOS About panel shows `px0 <version>` (from `version.go`/`VERSION`) and "Code navigator with agent editing".
 - Git queries on the open path (`gitProbe`, `gitHeadCommit`) go through `gitQuery`, bounded by `gitQueryTimeout` (5s). A hung git is treated like a non-git folder.
 
 ## Uncertain / follow-ups
