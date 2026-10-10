@@ -1,5 +1,6 @@
 // web/src/markdown.js
-import { $, $$, S, doc_, api, isMac, MOD, LH, persistPreference } from './state.js';
+import { $, $$, S, doc_, esc, api, isMac, MOD, LH, persistPreference } from './state.js';
+import { on } from './bus.js';
 import { vp, rowsEl, copyToClipboard, showToast } from './ui.js';
 import { render, paint, rowFor, markNodes } from './renderer.js';
 import { openFile } from './tabs.js';
@@ -9,12 +10,16 @@ import { showPanel } from './panels.js';
 import { revealDir } from './tree.js';
 import { findbar, runFind } from './find.js';
 import { hideHover } from './hover.js';
+import { buildTable } from './table.js';
+import { renderMermaidBlocks, exitMermaidFullscreen } from './mermaid.js';
 
 /* Markdown tabs open rendered. The server converts the file with goldmark and
    passes raw HTML through, so nothing it returns is trusted: mdSanitize rebuilds
    it against an allowlist in an inert document before any of it reaches the page.
    Every block carries the source line it starts on (data-line), which keeps the
-   preview in step with line-based navigation and with the source view. */
+   preview in step with line-based navigation and with the source view.
+   CSV and TSV tabs use the same overlay for a table (table.js), with its own
+   remembered setting; rows carry data-line the same way. */
 
 export const mdview = $('#mdview');
 const mdArticle = $('#md');
@@ -22,9 +27,17 @@ const mdArticle = $('#md');
 let mdShown = null;  // doc the preview is showing, null while it is hidden
 let mdDrawn = null;  // doc whose HTML is in the article; drawing can wait on a fetch
 let mdGen = 0;
+let mdThemeTimer = 0;
+
+/* 'markdown', 'table', or '' for a tab with no rendered view. */
+export function previewKind(d = doc_()) {
+  return d ? (d.markdown ? 'markdown' : d.table ? 'table' : '') : '';
+}
 
 export function previewing(d = doc_()) {
-  return !!(d && d.markdown && S.mdPreview && !d.mdError && !d.diffMode);
+  const kind = previewKind(d);
+  const on = kind === 'markdown' ? S.mdPreview : kind === 'table' ? S.tablePreview : false;
+  return !!(on && !d.mdError && !d.diffMode);
 }
 
 /* Show or hide the preview to match the active tab. Call whenever that changes. */
@@ -32,6 +45,7 @@ export function syncPreview() {
   const d = doc_();
   const want = previewing(d) ? d : null;
   if (want === mdShown) return;
+  exitMermaidFullscreen();
   if (mdShown && mdDrawn === mdShown) mdShown.mdScroll = mdview.scrollTop;
   mdShown = want;
   mdDrawn = null;
@@ -42,10 +56,12 @@ export function syncPreview() {
 
 async function drawPreview(d) {
   const gen = ++mdGen;
-  if (d.mdHtml === undefined) {
+  const table = previewKind(d) === 'table';
+  if ((table ? d.tableData : d.mdHtml) === undefined) {
     try {
-      d.mdReq = d.mdReq || api('/api/markdown', { path: d.path });
-      d.mdHtml = (await d.mdReq).html;
+      d.mdReq = d.mdReq || api(table ? '/api/table' : '/api/markdown', { path: d.path });
+      const j = await d.mdReq;
+      if (table) d.tableData = j; else d.mdHtml = j.html;
     } catch (e) {
       d.mdError = e.message; // this tab falls back to its source
       if (gen === mdGen && mdShown === d) {
@@ -59,8 +75,15 @@ async function drawPreview(d) {
     }
     if (gen !== mdGen || mdShown !== d) return;
   }
-  mdArticle.replaceChildren(mdSanitize(d.mdHtml, d.path));
-  mdEnhance();
+  mdArticle.className = table ? 'csv' : 'md';
+  if (table) {
+    mdArticle.replaceChildren(buildTable(d.tableData, d.total));
+  } else {
+    mdArticle.replaceChildren(mdSanitize(d.mdHtml, d.path));
+    mdEnhance();
+    const current = () => gen === mdGen && mdShown === d;
+    if (!await renderMermaidBlocks(mdArticle, current) || !current()) return;
+  }
   mdDrawn = d;
   const target = d.mdAnchor && mdFindAnchor(d.mdAnchor);
   if (target) mdScrollTo(target);
@@ -71,19 +94,35 @@ async function drawPreview(d) {
   if (!findbar.hidden) runFind();
 }
 
+function scheduleMermaidThemeRender() {
+  clearTimeout(mdThemeTimer);
+  mdThemeTimer = setTimeout(async () => {
+    const d = mdShown;
+    if (!d || mdDrawn !== d || !mdArticle.querySelector('.md-pre[data-lang="mermaid" i]')) return;
+    const line = previewTopLine();
+    const gen = ++mdGen;
+    const current = () => gen === mdGen && mdShown === d;
+    if (!await renderMermaidBlocks(mdArticle, current) || !current()) return;
+    mdDrawn = d;
+    previewLine(line);
+    if (!findbar.hidden) runFind();
+  }, 120);
+}
+
 export function togglePreview() {
   const d = doc_();
-  if (!d || !d.markdown) { showToast('!', 'Preview works on Markdown files'); return; }
+  if (!previewKind(d)) { showToast('!', 'Preview works on Markdown, CSV and TSV files'); return; }
   hideHover();
+  exitMermaidFullscreen();
   if (previewing(d)) {
     const line = mdDrawn === d ? previewTopLine() : 1;
-    mdSetPref(false);
+    mdSetPref(d, false);
     syncPreview();
     sourceToLine(line);
   } else {
     d.mdError = '';
     d.mdLine = sourceTopLine();
-    mdSetPref(true);
+    mdSetPref(d, true);
     syncPreview();
   }
   if (!findbar.hidden) runFind(); else S.find = null;
@@ -91,9 +130,11 @@ export function togglePreview() {
   updateStatus();
 }
 
-function mdSetPref(on, persist = true) {
-  S.mdPreview = on;
-  if (persist) persistPreference('markdown.preview.open', on).catch(() => {});
+function mdSetPref(d, on) {
+  const table = previewKind(d) === 'table';
+  if (table) S.tablePreview = on; else S.mdPreview = on;
+  try { localStorage.setItem(table ? 'px0.tablePreview' : 'px0.mdPreview', on ? 'true' : 'false'); } catch {}
+  persistPreference(table ? 'table.preview.open' : 'markdown.preview.open', on).catch(() => {});
 }
 
 /* ---------- sanitising ---------- */
@@ -144,7 +185,7 @@ function mdSanitize(html, docPath) {
         c === 'md-code' || c.startsWith('footnote') || (tag === 'i' && MD_TOKENS.has(c)));
       if (keep.length) el.className = keep.join(' ');
     }
-    if (tag === 'input') el.disabled = true;
+    if (tag === 'input') /** @type {HTMLInputElement} */ (el).disabled = true;
     if (tag === 'img') mdSetImage(el, mdURL(attrs.src || ''), base);
     if (tag === 'a' && attrs.href) mdSetLink(el, mdURL(attrs.href), base);
   }
@@ -181,7 +222,8 @@ function mdSetImage(img, src, base) {
   } else if (src) {
     const t = mdLocal(src, base);
     if (t) {
-      img.setAttribute('src', '/api/raw?path=' + encodeURIComponent(t.path));
+      const rawUrl = new URL('api/raw?path=' + encodeURIComponent(t.path), document.baseURI || location.href).href;
+      img.setAttribute('src', rawUrl);
       img.dataset.rawPath = t.path;
       img.dataset.origSrc = src;
     }
@@ -206,7 +248,8 @@ function mdSetLink(a, href, base) {
   }
   const t = mdLocal(href, base);
   if (!t) return;
-  a.setAttribute('href', '/api/raw?path=' + encodeURIComponent(t.path));
+  const rawUrl = new URL('api/raw?path=' + encodeURIComponent(t.path), document.baseURI || location.href).href;
+  a.setAttribute('href', rawUrl);
   a.dataset.path = t.path;
   if (t.hash) a.dataset.anchor = t.hash;
 }
@@ -256,8 +299,14 @@ function mdAlert(q) {
 
 const MD_GAP = 16; // space left above a block scrolled into place
 
+/* A table's header row is sticky, so a row placed at the top must clear it. */
+function mdGap() {
+  const head = mdArticle.className === 'csv' && mdArticle.querySelector('thead');
+  return head ? head.getBoundingClientRect().height : MD_GAP;
+}
+
 function mdScrollTo(el) {
-  mdview.scrollTop += el.getBoundingClientRect().top - mdview.getBoundingClientRect().top - MD_GAP;
+  mdview.scrollTop += el.getBoundingClientRect().top - mdview.getBoundingClientRect().top - mdGap();
 }
 
 function mdFindAnchor(anchor) {
@@ -280,15 +329,19 @@ export function previewLine(n) {
     const l = +el.dataset.line;
     if (l <= n && l > at) { best = el; at = l; }
   }
-  if (best) mdScrollTo(best); else mdview.scrollTop = 0;
+  // A table's header row is sticky, so it always measures as already in place.
+  if (best && !best.closest('thead')) mdScrollTo(best); else mdview.scrollTop = 0;
 }
 
 /* Source line of the last block starting at or above the top of the preview,
    counting one that mdScrollTo has just placed there. */
 export function previewTopLine() {
-  const top = mdview.getBoundingClientRect().top + MD_GAP + 8;
+  const top = mdview.getBoundingClientRect().top + mdGap() + 8;
   let line = 1;
-  for (const el of mdArticle.querySelectorAll('[data-line]')) {
+  const blocks = mdArticle.querySelectorAll('[data-line]');
+  // Unscrolled, a table's first row sits just under the header, inside the cutoff.
+  if (mdArticle.className === 'csv' && mdview.scrollTop === 0) return blocks.length ? +blocks[0].dataset.line : 1;
+  for (const el of blocks) {
     if (el.getBoundingClientRect().top > top) break;
     line = +el.dataset.line;
   }
@@ -342,8 +395,8 @@ function mdJump(anchor) {
   if (!d || !el) return;
   pushHistory(d.path, previewTopLine());
   mdScrollTo(el);
-  const block = el.closest('[data-line]');
-  if (block) pushHistory(d.path, +block.dataset.line);
+  const block = /** @type {HTMLElement|null} */ (el.closest('[data-line]'));
+  if (block && block.dataset.line) pushHistory(d.path, +block.dataset.line);
 }
 
 /* ---------- keys, select all, find ---------- */
@@ -376,11 +429,18 @@ export function clearPreviewMarks() {
   if (marks.length) mdArticle.normalize();
 }
 
-/* Marks every case-insensitive match of q in the rendered text; returns the count. */
-export function findInPreview(q) {
+/* Marks every match of q in the rendered text; returns the count. */
+export function findInPreview(q, caseSensitive) {
   clearPreviewMarks();
   if (!q) return 0;
-  const marks = markNodes(mdArticle, q, false, 'mark');
+  // Hidden Mermaid source is retained for code/raw-copy, not visible search.
+  // A table's line numbers and cap footer are chrome, not content.
+  const marks = markNodes(mdArticle, q, caseSensitive, 'mark').filter(m => {
+    if (!m.closest('[hidden], .ln, .csv-cap')) return true;
+    m.replaceWith(...m.childNodes);
+    return false;
+  });
+  if (mdArticle.className === 'csv') mdArticle.normalize();
   for (const m of marks) m.classList.add('md-hit');
   return marks.length;
 }
@@ -419,8 +479,21 @@ export function initMarkdown() {
   });
 
   mdArticle.addEventListener('click', e => {
+    if (e.target.closest('.csv-open-source')) { togglePreview(); return; }
     const copy = e.target.closest('.md-copy');
-    if (copy) { copyToClipboard($('pre', copy.parentElement).textContent, 'Copied code block'); return; }
+    if (copy) {
+      const pre = $('pre', copy.parentElement);
+      if (pre) {
+        copyToClipboard(pre.textContent || '', 'Copied code block');
+        copy.classList.add('copied');
+        copy.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5 8.5 6.5 11.5 12.5 5.5"/></svg>';
+        setTimeout(() => {
+          copy.classList.remove('copied');
+          copy.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5V3a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg>';
+        }, 1400);
+      }
+      return;
+    }
 
     // Standalone image click opens interactive lightbox
     const img = e.target.closest('img.md-zoomable');
@@ -458,7 +531,220 @@ export function initMarkdown() {
       }
     });
   }
+  const copyMdBtn = $('#btn-copy-md');
+  if (copyMdBtn) {
+    copyMdBtn.addEventListener('click', () => copyFullMarkdown(copyMdBtn));
+  }
+
+  on('tab:activated', () => syncPreview());
+  on('tabs:cleared', () => syncPreview());
+  on('theme:changed', scheduleMermaidThemeRender);
 }
+
+export function getDocRaw(d) {
+  if (!d) return Promise.resolve('');
+  if (d.rawText !== undefined) return Promise.resolve(d.rawText);
+  if (!d.rawTextPromise) {
+    const rawUrl = new URL('api/raw?path=' + encodeURIComponent(d.path), document.baseURI || location.href).href;
+    d.rawTextPromise = fetch(rawUrl)
+      .then(r => { if (!r.ok) throw new Error(r.statusText); return r.text(); })
+      .then(t => { d.rawText = t; return t; })
+      .catch(e => { d.rawTextPromise = null; throw e; });
+  }
+  return d.rawTextPromise;
+}
+
+export async function copyFullMarkdown(btn = null) {
+  const d = doc_();
+  if (!d) return;
+  const trigger = btn || $('#btn-copy-md');
+  try {
+    const raw = await getDocRaw(d);
+    const lineCount = raw.split('\n').length;
+    copyToClipboard(raw, `Copied ${d.name} (${lineCount.toLocaleString()} lines)`, trigger);
+  } catch (err) {
+    showToast('!', 'Failed to read markdown: ' + err.message);
+  }
+}
+
+export function getFragmentPlainText(frag) {
+  const clone = frag.cloneNode(true);
+  for (const wrap of clone.querySelectorAll?.('.md-pre.md-mermaid-ready') || []) {
+    const source = wrap.querySelector('pre');
+    const diagram = wrap.querySelector('.md-mermaid');
+    if (source && diagram) diagram.replaceWith(document.createTextNode(source.textContent || ''));
+  }
+  const bad = clone.querySelectorAll?.('.md-copy, .line-btn, [hidden], svg, style, script');
+  if (bad) {
+    for (const b of bad) b.remove();
+  }
+  return (clone.textContent || '').replace(/\r\n/g, '\n');
+}
+
+export function getFragmentHtml(frag) {
+  const clone = frag.cloneNode(true);
+  for (const wrap of clone.querySelectorAll?.('.md-pre.md-mermaid-ready') || []) {
+    const source = wrap.querySelector('pre');
+    const diagram = wrap.querySelector('.md-mermaid');
+    if (source && diagram) {
+      source.hidden = false;
+      diagram.remove();
+    }
+  }
+  const bad = clone.querySelectorAll?.('.md-copy, .line-btn, [hidden]');
+  if (bad) {
+    for (const b of bad) b.remove();
+  }
+  const div = document.createElement('div');
+  div.appendChild(clone);
+  return div.innerHTML;
+}
+
+export function getMarkdownRangeLines(range) {
+  let l1 = 0, l2 = 0;
+  const blocks = mdArticle.querySelectorAll('[data-line]');
+  for (const b of blocks) {
+    if (range.intersectsNode(b)) {
+      const line = +b.dataset.line;
+      if (!l1 || line < l1) l1 = line;
+      if (line > l2) l2 = line;
+    }
+  }
+  return { l1: l1 || 1, l2: l2 || l1 || 1 };
+}
+
+export function domToMarkdown(node) {
+  if (!node) return '';
+  if (node.nodeType === 3) return node.nodeValue;
+  if (node.nodeType !== 1 && node.nodeType !== 11) return '';
+
+  if (node.matches && (node.matches('.md-copy, .line-btn, [hidden], svg') || node.classList?.contains('md-copy'))) {
+    return '';
+  }
+
+  const tag = node.nodeType === 1 ? node.tagName.toLowerCase() : '';
+
+  if (tag === 'div' && node.classList.contains('md-pre')) {
+    const pre = node.querySelector('pre') || node;
+    const lang = node.dataset.lang || pre.dataset.lang || '';
+    const code = (node.querySelector('code') || pre).textContent || '';
+    return '\n```' + lang + '\n' + code.replace(/\r\n/g, '\n').trimEnd() + '\n```\n\n';
+  }
+
+  if (tag === 'pre') {
+    const lang = node.dataset.lang || node.closest('.md-pre')?.dataset.lang || '';
+    const code = (node.querySelector('code') || node).textContent || '';
+    return '\n```' + lang + '\n' + code.replace(/\r\n/g, '\n').trimEnd() + '\n```\n\n';
+  }
+
+  if (/^h[1-6]$/.test(tag)) {
+    const level = parseInt(tag[1], 10);
+    const hashes = '#'.repeat(level);
+    return '\n' + hashes + ' ' + innerDomToMarkdown(node).trim() + '\n\n';
+  }
+
+  if (tag === 'blockquote') {
+    let alertType = '';
+    for (const c of (node.className || '').split(/\s+/)) {
+      if (c.startsWith('md-alert-')) {
+        alertType = c.slice('md-alert-'.length).toUpperCase();
+        break;
+      }
+    }
+    let body = innerDomToMarkdown(node).trim();
+    if (alertType) body = `[!${alertType}]\n` + body;
+    const lines = body.split('\n').map(l => '> ' + l).join('\n');
+    return '\n' + lines + '\n\n';
+  }
+
+  if (tag === 'p') {
+    if (node.classList.contains('md-alert-title')) return '';
+    return innerDomToMarkdown(node).trim() + '\n\n';
+  }
+
+  if (tag === 'ul' || tag === 'ol') {
+    let idx = 1;
+    let out = '\n';
+    for (const child of node.children) {
+      if (child.tagName.toLowerCase() === 'li') {
+        const prefix = tag === 'ol' ? `${idx++}. ` : '- ';
+        let item = innerDomToMarkdown(child).trim();
+        item = item.split('\n').map((l, i) => i === 0 ? l : '  ' + l).join('\n');
+        out += prefix + item + '\n';
+      }
+    }
+    return out + '\n';
+  }
+
+  if (tag === 'li') {
+    let check = '';
+    const cb = node.querySelector('input[type="checkbox"]');
+    if (cb) check = cb.checked ? '[x] ' : '[ ] ';
+    return check + innerDomToMarkdown(node).trim();
+  }
+
+  if (tag === 'table') {
+    const trs = [...node.querySelectorAll('tr')];
+    if (!trs.length) return '';
+    let out = '\n';
+    let isHeader = true;
+    for (const tr of trs) {
+      const cells = [...tr.children].filter(c => /^t[hd]$/i.test(c.tagName));
+      if (!cells.length) continue;
+      const row = '| ' + cells.map(c => innerDomToMarkdown(c).trim().replace(/\|/g, '\\|').replace(/\n+/g, ' ')).join(' | ') + ' |';
+      out += row + '\n';
+      if (isHeader && tr.querySelector('th')) {
+        out += '| ' + cells.map(() => '---').join(' | ') + ' |\n';
+        isHeader = false;
+      }
+    }
+    return out + '\n';
+  }
+
+  if (tag === 'strong' || tag === 'b') {
+    const txt = innerDomToMarkdown(node);
+    return txt ? '**' + txt + '**' : '';
+  }
+  if (tag === 'em' || tag === 'i') {
+    if (node.closest('pre, code')) return node.textContent;
+    const txt = innerDomToMarkdown(node);
+    return txt ? '*' + txt + '*' : '';
+  }
+  if (tag === 'del' || tag === 's' || tag === 'strike') {
+    const txt = innerDomToMarkdown(node);
+    return txt ? '~~' + txt + '~~' : '';
+  }
+  if (tag === 'code') {
+    if (node.closest('pre')) return node.textContent;
+    return '`' + node.textContent + '`';
+  }
+  if (tag === 'a') {
+    const href = node.dataset.rawPath || node.dataset.path || node.getAttribute('href') || '';
+    const txt = innerDomToMarkdown(node).trim() || href;
+    return '[' + txt + '](' + href + ')';
+  }
+  if (tag === 'img') {
+    const src = node.dataset.rawPath || node.dataset.origSrc || node.getAttribute('src') || '';
+    const alt = node.getAttribute('alt') || '';
+    return '![' + alt + '](' + src + ')';
+  }
+  if (tag === 'hr') return '\n---\n\n';
+  if (tag === 'br') return '\n';
+  if (tag === 'input' && node.getAttribute('type') === 'checkbox') {
+    return node.checked ? '[x] ' : '[ ] ';
+  }
+
+  return innerDomToMarkdown(node);
+}
+
+function innerDomToMarkdown(node) {
+  let s = '';
+  for (const c of node.childNodes) {
+    s += domToMarkdown(c);
+  }
+  return s;
+}
+
 
 export function openLightbox(img) {
   const lb = $('#img-lightbox');
@@ -496,12 +782,12 @@ export function openLightbox(img) {
     };
     lbCopyPath.hidden = false;
     lbCopyPath.onclick = () => {
-      copyToClipboard(rawPath, 'Copied image path');
+      copyToClipboard(rawPath, 'Copied image path', lbCopyPath);
     };
   } else {
     lbOpenTab.hidden = true;
     lbCopyPath.onclick = () => {
-      copyToClipboard(src, 'Copied image URL');
+      copyToClipboard(src, 'Copied image URL', lbCopyPath);
     };
   }
 

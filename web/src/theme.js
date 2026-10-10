@@ -3,13 +3,21 @@
 // prefixed with :root or html. The server joins web/themes/*.css into
 // /static/themes.css, so themes are discovered from the loaded stylesheets and
 // adding one needs no JavaScript change. See docs/internals/styling-and-themes.md.
-import { persistPreference } from './state.js';
 import { showToast } from './ui.js';
+import { apiPostJson } from './state.js';
+import { DEFAULT_THEME, chooseThemePreference } from './theme-preference.js';
+import { emit } from './bus.js';
 
-const DEFAULT_THEME = 'github-dark';
+const KEY = 'px0.theme';
 const THEME_SELECTOR = /^(?::root|html)?\[data-theme=["']?([\w-]+)["']?\]$/;
 
+export { DEFAULT_THEME, chooseThemePreference };
+
 let themes = null;
+
+export function getStoredTheme() {
+  try { return localStorage.getItem(KEY); } catch { return null; }
+}
 
 export function listThemes() {
   if (themes) return themes;
@@ -39,32 +47,32 @@ export function listThemes() {
 
 export const currentTheme = () => document.documentElement.dataset.theme;
 
-export function setTheme(id) {
+export function setTheme(id, persist = true) {
   if (!listThemes().some(t => t.id === id)) return false;
+  const changed = currentTheme() !== id;
   document.documentElement.dataset.theme = id;
-  return true;
-}
-
-export async function chooseTheme(id) {
-  if (!setTheme(id)) return false;
-  try { await persistPreference('workbench.colorTheme', id); }
-  catch (err) {
-    showToast('!', 'Could not save theme: ' + err.message);
-    return false;
+  if (persist) {
+    try { localStorage.setItem(KEY, id); } catch {}
+    void apiPostJson('api/settings', { 'workbench.colorTheme': id }).catch(() => {});
   }
+  if (changed) emit('theme:changed', id);
   return true;
 }
 
-export async function cycleTheme() {
+export function cycleTheme() {
   const all = listThemes();
   if (!all.length) return;
   const next = all[(all.findIndex(t => t.id === currentTheme()) + 1) % all.length];
-  if (await chooseTheme(next.id)) showToast('Theme', next.name);
+  setTheme(next.id);
+  showToast('Theme', next.name);
 }
 
 export function initTheme() {
-  if (setTheme(DEFAULT_THEME)) return;
+  const saved = getStoredTheme();
+  const preferred = chooseThemePreference(saved, null);
+  if (preferred && setTheme(preferred, false)) return;
+  if (setTheme(DEFAULT_THEME, false)) return;
   // The attribute in index.html may name a theme that was since removed.
   const all = listThemes();
-  if (all.length && !all.some(t => t.id === currentTheme())) setTheme(all[0].id);
+  if (all.length && !all.some(t => t.id === currentTheme())) setTheme(all[0].id, false);
 }

@@ -1,15 +1,15 @@
 // web/src/main.js
 import { $, S, api, applyKeyLabels } from './state.js';
 import { measure, layout, render, initRenderer, updateEditorOptionControls } from './renderer.js';
-import { initTabs, openFile } from './tabs.js';
+import { initTabs, openFile, restoreWorkspaceTabs, switchTab } from './tabs.js';
 import { initCursor } from './cursor.js';
 import { initHover } from './hover.js';
 import { initSelectionBar } from './selbar.js';
-import { drawTree, treeEl, initTree, revealFile } from './tree.js';
+import { drawTree, treeEl, initTree, revealFile, refreshTree, restoreOpenDirs, setSidebarMode, updateSidebarToggleState, hasGitView } from './tree.js';
 import { initSearch } from './search.js';
 import { initOutline } from './outline.js';
 import { initPanels } from './panels.js';
-import { initInspector } from './inspector.js';
+import { initInspector, showRightInspector } from './inspector.js';
 import { initCalls } from './calls.js';
 import { initFind } from './find.js';
 import { initPalette } from './palette.js';
@@ -18,10 +18,17 @@ import { initTheme } from './theme.js';
 import { initMarkdown } from './markdown.js';
 import { initDiff } from './diff.js';
 import { initAgent, applyAgentMeta, loadAgentAsync } from './agent.js';
-import { initMetrics, initStatusFit, updateMetricsDisplay, updateStatus } from './status.js';
+import { initThreads } from './thread.js';
+import { initMetrics, initLspMenu, refreshLspMenu, initStatusFit, updateMetricsDisplay, updateStatus } from './status.js';
 import { initSettings } from './settings.js';
 import { initVim } from './vim.js';
 import { initImageViewer } from './imageview.js';
+import { initGitStream } from './gitstream.js';
+import { initGitPanel } from './gitpanel.js';
+import { initPR } from './pr.js';
+import { initLineComment } from './linecomment.js';
+import { initUnpushed, refreshUnpushed } from './unpushed.js';
+import { initPRScope } from './prscope.js';
 
 // Initialize all subsystems
 initRenderer();
@@ -30,6 +37,7 @@ initCursor();
 initHover();
 initSelectionBar();
 initTree();
+initGitPanel();
 initSearch();
 initOutline();
 initPanels();
@@ -41,17 +49,37 @@ initShortcuts();
 initMarkdown();
 initDiff();
 initAgent();
+initThreads();
 initMetrics();
+initLspMenu();
 initStatusFit();
 initSettings();
 initVim();
 initImageViewer();
+initLineComment();
+initUnpushed();
+initPRScope();
 
 // Bootstrap application lifecycle
 (async function boot() {
   try {
     initTheme();
-    document.body.classList.add('word-wrap');
+
+    // Restore word wrap (default ON)
+    const wrapPref = localStorage.getItem('px0.wrap');
+    S.wrap = wrapPref !== null ? wrapPref === 'true' : true;
+    document.body.classList.toggle('word-wrap', S.wrap);
+
+    // Line numbers are always ON
+    S.lineNumbers = true;
+    document.body.classList.remove('hide-lines');
+
+    // Restore Markdown preview (default ON)
+    const mdPref = localStorage.getItem('px0.mdPreview');
+    S.mdPreview = mdPref !== null ? mdPref === 'true' : true;
+    const tablePref = localStorage.getItem('px0.tablePreview');
+    S.tablePreview = tablePref !== null ? tablePref === 'true' : true;
+
     updateEditorOptionControls();
   } catch {}
 
@@ -60,17 +88,58 @@ initImageViewer();
   measure();
   S.meta = await api('/api/meta');
   if (S.meta.metrics) updateMetricsDisplay(S.meta.metrics);
-  if (S.meta.git) { const b = $('#btn-changed'); if (b) b.hidden = false; }
+  refreshLspMenu();
+  updateSidebarToggleState();
   applyAgentMeta();
+  initPR();
+  showRightInspector(); // the right sidebar starts open, on Threads when there is a harness
   document.title = S.meta.name + ' - px0';
   $('#root-name').textContent = S.meta.name;
   $('#root-name').title = S.meta.root;
   if (S.meta.version) {
     const emptyVerEl = $('#empty-ver');
     if (emptyVerEl) emptyVerEl.textContent = 'v' + S.meta.version;
+    const stVerEl = $('#st-ver');
+    if (stVerEl) {
+      stVerEl.textContent = 'v' + S.meta.version;
+      stVerEl.title = `px0 v${S.meta.version} (Click for shortcuts & help)`;
+    }
   }
   updateStatus();
-  await drawTree('', treeEl, 0);
+  try {
+    const session = await api('/api/session');
+    if (session && Array.isArray(session.openDirs) && session.openDirs.length > 0) {
+      restoreOpenDirs(session.openDirs);
+    }
+  } catch {}
+  await refreshTree();
+  initGitStream();
+
+  // Split into helpers so the readiness poll below can redo this once the
+  // background indexer (main.go's `go ix.Build()`) finishes: gitChanges/
+  // gitFiles are zero until then, so a session that loads before indexing
+  // completes (common right after `px0 <pr-url>`) would otherwise never
+  // auto-select a diff tab -- until the next manual reload.
+  const applyGitSidebarState = async () => {
+    // The unpushed list decides this too: a clean tree with local commits
+    // still belongs in Git view, which is the only place they are listed.
+    await refreshUnpushed();
+    const showGit = hasGitView();
+    await setSidebarMode(showGit ? 'git' : 'files');
+    return !!(S.meta?.git && S.meta.gitChanges > 0);
+  };
+  const selectChangedFileTab = async () => {
+    if (S.tabs[S.active]?.diffAvailable) return;
+    const changedTabIdx = S.tabs.findIndex(t => t.diffAvailable);
+    if (changedTabIdx >= 0) {
+      switchTab(changedTabIdx);
+    } else if (S.meta.gitFiles && S.meta.gitFiles.length > 0) {
+      await openFile(S.meta.gitFiles[0]);
+      await revealFile(S.meta.gitFiles[0]);
+    }
+  };
+
+  let hasGitChanges = await applyGitSidebarState();
 
   const params = new URLSearchParams(window.location.search);
   const initialPath = params.get('path');
@@ -86,6 +155,9 @@ initImageViewer();
       const cleanUrl = u.pathname + (cleanSearch ? '?' + cleanSearch : '') + u.hash;
       window.history.replaceState({}, '', cleanUrl);
     } catch {}
+  } else {
+    await restoreWorkspaceTabs();
+    if (hasGitChanges) await selectChangedFileTab();
   }
 
   if (document.fonts && document.fonts.ready) {
@@ -102,6 +174,10 @@ initImageViewer();
         if (m.ready) {
           S.meta = m;
           updateStatus();
+          if (!initialPath) {
+            hasGitChanges = await applyGitSidebarState();
+            if (hasGitChanges) await selectChangedFileTab();
+          }
           return;
         }
       } catch {

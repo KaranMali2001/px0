@@ -1,0 +1,45 @@
+# Desktop Merge Notes (upstream 02db0c7 into `desktop-parity`)
+
+Merge of upstream `master` at `02db0c7` into `desktop-parity` (base `6be8a06` + desktop snapshot `b8e3012`). Upstream wins on shared web behaviour; the Wails desktop integration is kept and adapted.
+
+## Conflicts and resolutions
+
+| File | Resolution |
+| --- | --- |
+| `go.mod`, `go.sum` | Upstream module set (`github.com/px0-ai/harness`) plus `github.com/wailsapp/wails/v2 v2.16.0` and its indirect deps, re-tidied. `go` directive became `1.25.0` (from tidy). |
+| `main.go` | Upstream `main.go` (PR URLs, `-base-path`, telemetry, timing) with `//go:build !desktop`, the `-d` flag, and the desktop branch re-added. `-d` with a PR URL is rejected. `version`, `resolveTarget`, `splitTargetLine` and `fatal` stay in `version.go` / `target.go` (they are identical to upstream's copies) so the desktop build still has them. |
+| `server.go` | Kept both: upstream base-path routing (`registerRoutes`, `SetBasePath`) and `CloseThreads`, plus desktop `trustedDesktopRequest` / `isTrustedDesktopRequest`. The embed list now includes `web/static` (see below). |
+| `highlight.go` | Upstream imports (`strconv`); desktop TypeScript method highlighting merged cleanly. |
+| `settings_test.go` | Kept both `TestSettingsAcceptsTrustedDesktopRequest` and upstream `TestSettingsBasePath`. |
+| `web/app.js` | Upstream no longer tracks the bundle (`.gitignore`). Removed from the index and regenerated with `node scripts/build-web.js`. |
+| `Makefile` | Upstream targets plus desktop `desktop`, `dmg`, `install-cli`, `install-desktop`, `install-local`. `clean` does both: upstream's `web/app.js` reset and desktop's `build/bin/` removal. |
+| `README.md` | Upstream README; the "Native macOS app" section moved under Installation. |
+| `docs/internals/styling-and-themes.md` | Upstream text (localStorage `px0.theme`, default `catppuccin-mocha`), plus a note that the theme is mirrored to `workbench.colorTheme` in `settings.json`. |
+| `web/index.html` | Upstream head (Google Fonts, relative `static/` URLs) plus the desktop `wails:` protocol class script. Favicons and sidebar/splash logos point at the embedded `static/static/...` copies instead of `px0.ai`. |
+| `web/style.css` | Upstream rules, with upstream's 340px sidebar width. Desktop's removal of the `#side` background stays, so the translucent desktop material still shows. Font URLs are now `static/fonts/...`. |
+| `web/src/state.js` | Upstream `request()` (base-relative URLs, JSON bodies) plus desktop's non-JSON / non-2xx error handling. Desktop `apiPostJSON` was dropped in favour of upstream `apiPostJson`. `persistPreference` was re-added on top of it. |
+| `web/src/theme.js` | Upstream (localStorage + settings mirror, `theme:changed`). Desktop `chooseTheme` was dropped because upstream `setTheme` already persists to settings. |
+| `web/src/settings.js` | Upstream (save status, `theme-preference`) plus the desktop sidebar location/width/visible settings and the rollback when a save fails. |
+| `web/src/panels.js` | Upstream `showPanel(name)` / `reindexWorkspace` plus desktop `setSidebarLocation`, `setSidebarVisible`, `toggleSidebar`, the persisted width, and dragging when the sidebar is on the right. |
+| `web/src/palette.js`, `web/src/shortcuts.js` | Upstream, with `Mod+B` routed through `toggleSidebar`. Palette theme preview uses `setTheme(id, false)` again. |
+| `web/src/main.js` | Upstream boot (localStorage defaults, git sidebar state). Desktop's meta-poll backoff kept, with a `return` after ready. Settings loaded later still override localStorage. |
+| `web/src/markdown.js` | Upstream table-aware `mdSetPref(d, on)`, also persisting to `markdown.preview.open` / `table.preview.open`. |
+| `web/src/renderer.js` | Desktop row recycling (`render(force)`, `paint(force)`) kept, now emitting upstream's gutter markup with `.line-btn`. |
+| `web/src/tabs.js` | Upstream `ref`/revision handling plus desktop `openFile` boolean result and `[px0 open]` console logging. |
+| `web/src/tree.js` | Upstream markup (your-change, stage tick, row menu) with desktop SVG icons. The click handler runs upstream's `focusDiffScope`/`syncDiffView` around desktop's loading state. |
+| `web/src/status.js` | Upstream (metrics arrive via the stream). Desktop focus-gated metrics polling was dropped as obsolete. |
+| `web/src/diff.js`, `web/src/vim.js` | Import lists merged. Desktop's settings-based persistence merged cleanly. |
+
+## Other changes made during the merge
+
+- `workbench.sideBar.width` default moved from 228 to 340 (`settings.go`, `settings.js`, `settings_test.go`) to match upstream's sidebar CSS.
+- `web/static` is now embedded. In `b8e3012` the `/static/` handler served `web/`, so `/static/favicon.ico` and `/static/fonts/*` did not resolve to `web/static/*`. Assets are now served at `static/static/...` (relative, so `-base-path` works too).
+- Three upstream git tests (`TestPRReviewerChangesInIndex`, `TestGitStagedFilesStatAndDiff`, `TestDeletedFileHandling`) failed on macOS because `t.TempDir()` lives under the `/var` → `/private/var` symlink. They now resolve the temp dir the same way other tests in `git_test.go` already do.
+
+## Uncertain / follow-ups
+
+- `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.
+- `go vet -tags desktop .` fails on `px0_test.go` (uses `listen` from `!desktop` `main.go`). This was already the case in `b8e3012`. Only the non-tagged vet/test plus `go build -tags desktop` are required.
+- Both Google Fonts (upstream) and the vendored JetBrains Mono `@font-face` rules load. Offline (desktop) uses the local files.
+- The `[px0 open]` console logging from the desktop snapshot was kept as-is. It looks like debugging output and may be worth removing.
+- Desktop row recycling in `renderer.js` was not checked against upstream's line-thread markers in a running app. The GUI was not launched.

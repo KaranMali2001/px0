@@ -1,5 +1,7 @@
 //go:build !desktop
 
+// Package main implements px0: a fast, local-first code navigator and review tool
+// that opens any repository or pull request in a responsive browser UI.
 package main
 
 import (
@@ -14,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,19 +31,22 @@ func main() {
 		desktop      = flag.Bool("d", false, "open a directory in the native macOS app")
 		noLSP        = flag.Bool("no-lsp", false, "do not use language servers, even if installed")
 		noGit        = flag.Bool("no-git", false, "disable git awareness")
-		dev          = flag.String("dev", "", "serve the UI from this source directory instead of the embedded copy")
 		showVer      = flag.Bool("version", false, "print version and exit")
 		showVerShort = flag.Bool("v", false, "print version and exit (shorthand)")
 		doUpdate     = flag.Bool("update", false, "check for and install latest version of px0")
+		noUpdate     = flag.Bool("no-update", false, "do not auto-update px0 on startup")
 		noColor      = flag.Bool("no-color", false, "disable colour output")
 		quiet        = flag.Bool("quiet", false, "suppress narration")
-		verbose      = flag.Bool("verbose", false, "log requests, searches, symbols, and agent prompts to terminal")
+		verbose      = flag.Bool("verbose", false, "log startup steps, requests, searches, symbols, and agent prompts to terminal")
 		noTelemetry  = flag.Bool("no-telemetry", false, "disable anonymous usage telemetry")
 		agentCmd     = flag.String("agent", "", "pin the coding harness used for edits (claude, gemini, cursor-agent, agy, opencode, codex, aider, goose, or a command template containing {prompt}); detected and chosen in the UI when omitted")
 		noAgent      = flag.Bool("no-agent", false, "do not offer editing through a coding harness")
+		_            = flag.Bool("y", false, "answer yes to prompts (deprecated; PRs are always opened without prompt)")
+		_            = flag.Bool("yes", false, "answer yes to prompts (alias for -y)")
+		basePathFlag = flag.String("base-path", "", "base URL path prefix to serve endpoints and assets from (e.g. /rev-123/)")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage: px0 [flags] [file or directory]\n\nflags:\n", version)
+		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage:\n  px0 [flags] [file or directory]\n  px0 [flags] <pr-url>\n\nflags:\n", version)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -71,17 +77,28 @@ func main() {
 		return
 	}
 
-	if *dev != "" {
-		if err := useDiskAssets(*dev); err != nil {
-			fatal(fmt.Errorf("-dev %s: %w", *dev, err))
+	// A full pull request URL (e.g. https://github.com/owner/repo/pull/123)
+	// checks out the PR's full source tree instead of resolving a local file/directory.
+	// Only full URLs via "px0 <url>" are supported for PR review.
+	target := "."
+	var prProvider GitProvider
+	var prTarget PRTarget
+	isPR := false
+	if flag.NArg() > 0 {
+		arg0 := flag.Arg(0)
+		if arg0 == "pr" {
+			fatal(fmt.Errorf("'px0 pr' is no longer supported; open pull requests directly with: px0 <url>"))
+		}
+		if provider, pt, ok := DetectPRURL(arg0); ok {
+			prProvider, prTarget, isPR = provider, pt, true
+		} else {
+			target = arg0
 		}
 	}
-
-	target := "."
-	if flag.NArg() > 0 {
-		target = flag.Arg(0)
-	}
 	if *desktop {
+		if isPR {
+			fatal(fmt.Errorf("-d does not support pull request URLs"))
+		}
 		root, err := desktopWorkspace(target)
 		if err != nil {
 			fatal(err)
@@ -91,22 +108,67 @@ func main() {
 		}
 		return
 	}
-	root, initialFile, initialLine, err := resolveTarget(target)
-	if err != nil {
-		fatal(err)
+	if isPR && gitDisabled {
+		fatal(fmt.Errorf("px0: git is required for PR review; remove -no-git"))
 	}
 
+	var pr *prSession
+	var root, initialFile string
+	var initialLine int
+	var targetDur time.Duration
+	if isPR {
+		sp := newSpinner(fmt.Sprintf("Preparing PR #%d (%s/%s)...", prTarget.Number, prTarget.Owner, prTarget.Repo), os.Stdout)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		p, err := checkoutPR(ctx, prProvider, prTarget, ".", func(msg string) {
+			sp.Update(msg)
+		})
+		cancel()
+		if err != nil {
+			sp.Fail(fmt.Sprintf("Failed to prepare PR #%d: %v", prTarget.Number, err))
+			fatal(fmt.Errorf("px0: %w", err))
+		}
+		if p.meta.Merged {
+			sp.Success(fmt.Sprintf("PR #%d checked out [merged] (%s)", prTarget.Number, p.meta.Title))
+		} else {
+			sp.Success(fmt.Sprintf("PR #%d checked out (%s)", prTarget.Number, p.meta.Title))
+		}
+		pr = p
+		root = p.Root()
+	} else {
+		tStart := time.Now()
+		r, f, l, err := resolveTarget(target)
+		if err != nil {
+			fatal(err)
+		}
+		targetDur = time.Since(tStart)
+		root, initialFile, initialLine = r, f, l
+	}
+
+	tListen := time.Now()
 	ln, addr, err := listen(*host, *port)
 	if err != nil {
 		fatal(err)
 	}
+	listenDur := time.Since(tListen)
 
+	tInit := time.Now()
 	ix := NewIndex(root)
 	lsp := newLSPManager(root, !*noLSP)
 	tel := NewTelemetryService(*noTelemetry)
 	defer tel.Close("normal")
 
-	pxSrv := NewServer(ix, lsp)
+	configuredBasePath := "/"
+	if *basePathFlag != "" {
+		configuredBasePath = cleanBasePath(*basePathFlag)
+	} else if cfg := readSettings(); cfg.ServerBasePath != nil && *cfg.ServerBasePath != "" {
+		configuredBasePath = cleanBasePath(*cfg.ServerBasePath)
+	}
+
+	pxSrv := NewServer(ix, lsp, configuredBasePath)
+	pxSrv.tel = tel
+	if pr != nil {
+		pxSrv.SetPR(pr)
+	}
 	var agent *agentManager
 	if !*noAgent {
 		agent, err = newAgentManager(root, *agentCmd, lsp)
@@ -115,18 +177,46 @@ func main() {
 		}
 		pxSrv.SetAgent(agent)
 	}
+	initDur := time.Since(tInit)
 
 	srv := &http.Server{Handler: pxSrv}
 
-	url := viewerURL(addr, initialFile, initialLine)
+	url := viewerURL(addr, initialFile, initialLine, configuredBasePath)
 	uiHeading("px0 "+version, nil, os.Stdout)
+	if pr != nil {
+		prTitle := fmt.Sprintf("#%d %s", pr.meta.Number, pr.meta.Title)
+		if pr.meta.Merged {
+			prTitle += " " + paint("[MERGED]", colorWarn, true, os.Stdout)
+		}
+		uiKV("PR", prTitle, 11, os.Stdout)
+		if pr.token == "" {
+			uiKV("access", uiDim(fmt.Sprintf("read-only (no %s token: set GITHUB_TOKEN or gh auth login to submit reviews)", pr.provider.Name()), os.Stdout), 11, os.Stdout)
+		}
+	}
 	uiKV("workspace", root, 11, os.Stdout)
 	uiKV("url", uiAccent(url, os.Stdout), 11, os.Stdout)
+	if *host == "0.0.0.0" {
+		for _, networkURL := range networkURLs(addr, initialFile, initialLine) {
+			uiKV("network", uiAccent(networkURL, os.Stdout), 11, os.Stdout)
+		}
+	}
 	uiHint("ctrl-c to stop", os.Stdout)
+
+	if uiVerbose {
+		if !isPR {
+			uiStatus("ok", "resolved workspace target", fmtDuration(targetDur), 0, os.Stdout)
+		}
+		uiStatus("ok", fmt.Sprintf("bound TCP listener on %s", addr), fmtDuration(listenDur), 0, os.Stdout)
+		uiStatus("ok", "initialized HTTP server and services", fmtDuration(initDur), 0, os.Stdout)
+	}
 
 	// Launch browser immediately without blocking startup.
 	if !*noOpen {
+		tBrowser := time.Now()
 		go openBrowser(url)
+		if uiVerbose {
+			uiStatus("ok", "spawned browser launcher", fmtDuration(time.Since(tBrowser)), 0, os.Stdout)
+		}
 	}
 
 	// Index workspace asynchronously so the server and UI respond in <1ms.
@@ -134,10 +224,20 @@ func main() {
 		ix.Build()
 		n, _, ms := ix.Stats()
 		uiStatus("ok", fmt.Sprintf("indexed %d files", n), fmt.Sprintf("%dms", ms), 0, os.Stdout)
-		if names := lsp.Available(); len(names) > 0 {
-			uiBullet(fmt.Sprintf("language servers: %s (started on first use)", strings.Join(names, ", ")), os.Stdout)
+		tLSP := time.Now()
+		names := lsp.Available()
+		lspDur := time.Since(tLSP)
+		if len(names) > 0 {
+			if uiVerbose {
+				uiStatus("ok", fmt.Sprintf("discovered language servers: %s", strings.Join(names, ", ")), fmtDuration(lspDur), 0, os.Stdout)
+			} else {
+				uiBullet(fmt.Sprintf("language servers: %s (started on first use)", strings.Join(names, ", ")), os.Stdout)
+			}
+		} else if uiVerbose {
+			uiStatus("ok", "checked language servers (none installed)", fmtDuration(lspDur), 0, os.Stdout)
 		}
 		if agent != nil {
+			tAgent := time.Now()
 			var found []string
 			for _, h := range agent.Detect() {
 				if h.Installed {
@@ -148,8 +248,13 @@ func main() {
 					found = append(found, item)
 				}
 			}
-			if uiVerbose && len(found) > 0 {
-				uiStatus("info", uiInfo("coding harnesses: "+strings.Join(found, ", "), os.Stdout), "", 0, os.Stdout)
+			agentDur := time.Since(tAgent)
+			if uiVerbose {
+				if len(found) > 0 {
+					uiStatus("ok", fmt.Sprintf("detected coding harnesses: %s", strings.Join(found, ", ")), fmtDuration(agentDur), 0, os.Stdout)
+				} else {
+					uiStatus("ok", "checked coding harnesses (none found)", fmtDuration(agentDur), 0, os.Stdout)
+				}
 			}
 		}
 
@@ -161,8 +266,11 @@ func main() {
 		})
 	}()
 
-	// Check for updates asynchronously once a day without delaying startup (<1ms).
-	go checkDailyUpdate(version)
+	// Check for updates in the background once the server is already up, so
+	// px0 never makes a network call before serving the first request.
+	if !*noUpdate {
+		go autoUpdate(version)
+	}
 
 	// Language servers are children that can hold gigabytes. Shut them down on
 	// the way out rather than leaving them for the OS to reap.
@@ -186,6 +294,8 @@ func main() {
 	err = srv.Serve(ln)
 	lsp.Close()
 	agent.Close()
+	pxSrv.CloseThreads()
+	pr.Close()
 
 	if interrupted {
 		tel.Close("interrupted")
@@ -198,8 +308,15 @@ func main() {
 	}
 }
 
-func viewerURL(addr, initialFile string, initialLine int) string {
+func viewerURL(addr, initialFile string, initialLine int, basePath ...string) string {
 	u := url.URL{Scheme: "http", Host: addr}
+	bp := "/"
+	if len(basePath) > 0 && basePath[0] != "" {
+		bp = cleanBasePath(basePath[0])
+	}
+	if bp != "/" {
+		u.Path = bp
+	}
 	q := u.Query()
 	if initialFile != "" {
 		q.Set("path", filepath.ToSlash(initialFile))
@@ -211,6 +328,53 @@ func viewerURL(addr, initialFile string, initialLine int) string {
 		u.RawQuery = q.Encode()
 	}
 	return u.String()
+}
+
+// networkURLs returns URLs for the machine's non-loopback IPv4 addresses.
+// The supplied address contributes the bound port; its host is intentionally
+// ignored because a bind address is not necessarily a usable destination.
+func networkURLs(addr, initialFile string, initialLine int) []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	return networkURLsFromAddrs(addr, initialFile, initialLine, addrs)
+}
+
+func networkURLsFromAddrs(addr, initialFile string, initialLine int, addrs []net.Addr) []string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	urls := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		var ip net.IP
+		switch a := addr.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		default:
+			continue
+		}
+
+		ip = ip.To4()
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			continue
+		}
+
+		host := ip.String()
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		urls = append(urls, viewerURL(net.JoinHostPort(host, port), initialFile, initialLine))
+	}
+
+	sort.Strings(urls)
+	return urls
 }
 
 // listen binds the requested port, walking forward if it is already taken so a

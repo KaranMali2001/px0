@@ -1,5 +1,5 @@
 // web/src/renderer.js
-import { $, S, doc_, api, persistPreference, LH, CHUNK, OVERSCAN } from './state.js';
+import { $, S, doc_, api, esc, persistPreference, LH, CHUNK, OVERSCAN } from './state.js';
 import { vp, sizer, rowsEl, editor } from './ui.js';
 
 export function measure() {
@@ -91,6 +91,7 @@ export function paint(force = true) {
     let rc = 'row', gc = 'g';
     if (n === d.cur) rc += ' cur';
     if (agentRanges.some(r => n >= r.l1 && n <= r.l2)) rc += ' agent-sel';
+    if (agentRanges.some(r => n === r.l1)) rc += ' agent-anchor';
     if (gut) {
       const m = gut.marks.get(n);
       if (m) gc += m === 'add' ? ' gut-add' : ' gut-mod';
@@ -103,7 +104,7 @@ export function paint(force = true) {
         row.dataset.l = n;
       }
       row.className = rc;
-      row.innerHTML = '<div class="' + gc + '">' + n + '</div><div class="c">' + (body === undefined ? '' : body) + '</div>';
+      row.innerHTML = '<div class="' + gc + '"><span class="line-btn" role="button" data-l="' + n + '" title="Thread and line actions">Edit</span>' + n + '</div><div class="c">' + (body === undefined ? '' : body) + '</div>';
     }
     const at = rowsEl.children[i - first];
     if (at !== row) rowsEl.insertBefore(row, at || null);
@@ -129,6 +130,7 @@ export function placeCaret() {
   const row = d && rowFor(d.cur);
   if (!row) { el.hidden = true; return null; }
   const code = $('.c', row);
+  if (!code) { el.hidden = true; return null; }
   const col = Math.max(0, Math.min(d.col || 0, code.textContent.length));
   let x, y;
   const text = code.textContent;
@@ -212,6 +214,7 @@ export function toPoint({ line, col }) {
   const row = rowFor(line);
   if (!row) return null;
   const code = $('.c', row);
+  if (!code) return null;
   const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
   let at = 0;
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
@@ -239,7 +242,7 @@ export function decorate(first, last, force = true) {
     for (const row of rows) {
       const n = +row.dataset.l;
       if (!byLine.has(n)) continue;
-      const marks = markNodes($('.c', row), S.find.q, S.find.ci, 'mark');
+      const marks = markNodes($('.c', row), S.find.q, S.find.cs, 'mark');
       if (act && act.line === n && marks[act.n]) marks[act.n].classList.add('on');
     }
   }

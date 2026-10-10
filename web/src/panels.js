@@ -3,12 +3,16 @@ import { $, $$, S, api, persistPreference } from './state.js';
 import { layout, render } from './renderer.js';
 import { updateStatus } from './status.js';
 import { loadOutline } from './outline.js';
-import { treeEl, openDirs, drawTree } from './tree.js';
+import { treeEl, refreshTree, setSidebarMode, hasGitView } from './tree.js';
 import { reloadOpenTabs } from './tabs.js';
 import { showToast } from './ui.js';
+import { refreshUnpushed } from './unpushed.js';
 
-export function showPanel(name) {
+export async function showPanel(name) {
   setSidebarVisible(true);
+  if (name === 'files') {
+    await setSidebarMode('files');
+  }
 }
 
 export function setSidebarLocation(location) {
@@ -34,17 +38,33 @@ function setSidebarWidth(width, persist = false) {
   if (persist) persistPreference('workbench.sideBar.width', next).catch(() => {});
 }
 
-export function initPanels() {
-  $('#btn-reindex').addEventListener('click', async () => {
+export async function reindexWorkspace() {
+  const btn = $('#btn-reindex');
+  const svg = btn?.querySelector('svg');
+  if (svg) svg.classList.add('spin');
+  try {
     const j = await api('/api/reindex');
     S.meta.files = j.files; S.meta.indexMs = j.indexMs;
-    treeEl.innerHTML = ''; openDirs.clear();
-    await drawTree('', treeEl, 0);
-    // Reindex is a refresh: re-fetch open tabs quietly in place without tab switching.
+    if (j.gitChanges !== undefined) S.meta.gitChanges = j.gitChanges;
+    if (j.gitFiles !== undefined) S.meta.gitFiles = j.gitFiles;
+    // A refresh re-reads the unpushed list too: commits may have been made,
+    // amended or pushed from a terminal since the last git-status tick, and
+    // hasGitView() below counts them.
+    await refreshUnpushed();
+    await setSidebarMode(hasGitView() ? 'git' : 'files');
+    await refreshTree();
     await reloadOpenTabs();
     updateStatus();
-    showToast('✓', 'Workspace reindexed');
-  });
+    showToast('✓', 'Workspace refreshed');
+  } catch (e) {
+    showToast('!', 'Refresh failed: ' + e.message);
+  } finally {
+    if (svg) svg.classList.remove('spin');
+  }
+}
+
+export function initPanels() {
+  $('#btn-reindex').addEventListener('click', reindexWorkspace);
 
   /* sidebar resize */
   (() => {

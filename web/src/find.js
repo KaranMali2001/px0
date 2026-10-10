@@ -1,5 +1,6 @@
 // web/src/find.js
 import { $, S, doc_, api, debounce, LH } from './state.js';
+import { on } from './bus.js';
 import { vp } from './ui.js';
 import { render, paint } from './renderer.js';
 import { centerLine } from './tabs.js';
@@ -8,6 +9,7 @@ import { mdview, previewing, findInPreview, showPreviewHit, clearPreviewMarks, p
 
 export const findbar = $('#findbar');
 export const findInput = $('#find-input');
+const findCase = $('#find-case');
 
 /* Text currently selected inside the editor viewport, reduced to its first
    non-empty line since find matches within a single line. */
@@ -44,10 +46,11 @@ export function clearFind() {
 export const runFind = debounce(async () => {
   const d = doc_(); if (!d) return;
   const q = findInput.value;
+  const cs = findCase.classList.contains('on');
   // The Markdown preview is searched as rendered text, in the page itself.
   if (previewing(d)) {
-    const n = findInPreview(q);
-    S.find = q ? { q, ci: false, hits: new Array(n).fill(null), byLine: new Set(), active: n ? 0 : -1, preview: true } : null;
+    const n = findInPreview(q, cs);
+    S.find = q ? { q, cs, hits: new Array(n).fill(null), byLine: new Set(), active: n ? 0 : -1, preview: true } : null;
     $('#find-count').textContent = !q ? '0' : n ? '1 / ' + n : 'no results';
     $('#minimap-hits').innerHTML = previewHitOffsets().map(p => '<i style="top:' + p + '%"></i>').join('');
     if (n) jumpToHit(0);
@@ -55,7 +58,7 @@ export const runFind = debounce(async () => {
   }
   if (!q) { S.find = null; $('#find-count').textContent = '0'; $('#minimap-hits').innerHTML = ''; paint(); return; }
   let j;
-  try { j = await api('/api/search', { q, glob: d.path }); } catch { return; }
+  try { j = await api('/api/search', { q, glob: d.path, case: cs ? 1 : '' }); } catch { return; }
   const f = (j.results || []).find(r => r.path === d.path);
   const hits = [];
   if (f) {
@@ -66,7 +69,7 @@ export const runFind = debounce(async () => {
       hits.push({ line: m.line, n });
     }
   }
-  S.find = { q, ci: false, hits, byLine: new Set(hits.map(h => h.line)), active: hits.length ? 0 : -1 };
+  S.find = { q, cs, hits, byLine: new Set(hits.map(h => h.line)), active: hits.length ? 0 : -1 };
   $('#find-count').textContent = hits.length ? '1 / ' + hits.length : 'no results';
   drawMinimap(hits, d.total);
   if (hits.length) jumpToHit(0); else paint();
@@ -74,7 +77,7 @@ export const runFind = debounce(async () => {
 
 export function drawMinimap(hits, total) {
   const mm = $('#minimap-hits');
-  if (!hits.length) { mm.innerHTML = ''; return; }
+  if (!hits.length || !total) { mm.innerHTML = ''; return; }
   const seen = new Set();
   mm.innerHTML = hits.filter(h => !seen.has(h.line) && seen.add(h.line))
     .map(h => '<i style="top:' + ((h.line - 1) / total * 100).toFixed(3) + '%"></i>').join('');
@@ -111,14 +114,16 @@ export function initFind() {
     if (e.key === 'Enter') { e.preventDefault(); jumpToHit(S.find ? S.find.active + (e.shiftKey ? -1 : 1) : 0); }
     if (e.key === 'Escape') { clearFind(); vp.focus(); }
   });
+  findCase.addEventListener('click', () => { findCase.classList.toggle('on'); runFind(); });
   $('#find-next').addEventListener('click', () => jumpToHit(S.find ? S.find.active + 1 : 0));
   $('#find-prev').addEventListener('click', () => jumpToHit(S.find ? S.find.active - 1 : 0));
   $('#find-close').addEventListener('click', clearFind);
   $('#minimap-hits').addEventListener('click', e => {
     const r = $('#minimap-hits').getBoundingClientRect();
-    const d = doc_(); if (!d) return;
+    const d = doc_(); if (!d || !r.height || !d.total) return;
     if (previewing(d)) { scrollPreviewTo((e.clientY - r.top) / r.height); return; }
     centerLine(Math.round((e.clientY - r.top) / r.height * d.total));
     render();
   });
+  on('tab:activated', clearFind);
 }

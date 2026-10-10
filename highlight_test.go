@@ -29,7 +29,14 @@ func fixtures(t *testing.T) []string {
 		root = "."
 	}
 	filepath.WalkDir(root, func(p string, de os.DirEntry, err error) error {
-		if err != nil || de.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if de.IsDir() {
+			name := de.Name()
+			if name == ".git" || name == "bench-repos" || name == "node_modules" || name == "dist" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		switch strings.ToLower(filepath.Ext(p)) {
@@ -40,8 +47,12 @@ func fixtures(t *testing.T) []string {
 		}
 		return nil
 	})
-	if len(files) > 400 {
-		files = files[:400]
+	maxFiles := 400
+	if testing.Short() {
+		maxFiles = 10
+	}
+	if len(files) > maxFiles {
+		files = files[:maxFiles]
 	}
 	if len(files) == 0 {
 		t.Skip("no fixtures")
@@ -151,7 +162,11 @@ func TestConcurrentChunkAccess(t *testing.T) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < 40; i++ {
+			loops := 40
+			if testing.Short() {
+				loops = 4
+			}
+			for i := 0; i < loops; i++ {
 				start := ((w*13 + i*7) % 5) * hlChunk
 				lines, _ := d.Lines(start, start+hlChunk)
 				if len(lines) == 0 {
@@ -262,3 +277,92 @@ func TestEvictRemovesDocument(t *testing.T) {
 		t.Fatalf("expected second Evict to return false")
 	}
 }
+
+func TestEvictAllClearsCache(t *testing.T) {
+	tmp1 := filepath.Join(t.TempDir(), "a.go")
+	tmp2 := filepath.Join(t.TempDir(), "b.go")
+	if err := os.WriteFile(tmp1, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp2, []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(tmp1, "a.go"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(tmp2, "b.go"); err != nil {
+		t.Fatal(err)
+	}
+	cache.mu.Lock()
+	countBefore := len(cache.items)
+	cache.mu.Unlock()
+	if countBefore == 0 {
+		t.Fatalf("expected items in cache")
+	}
+
+	EvictAll()
+
+	cache.mu.Lock()
+	countAfter := len(cache.items)
+	usedAfter := cache.used
+	cache.mu.Unlock()
+	if countAfter != 0 || usedAfter != 0 {
+		t.Fatalf("expected empty cache after EvictAll, got count=%d used=%d", countAfter, usedAfter)
+	}
+}
+
+func TestHighlightDiff(t *testing.T) {
+	// Empty diff
+	if hunks := highlightDiff("foo.go", ""); len(hunks) != 0 {
+		t.Fatalf("expected 0 hunks for empty diff, got %d", len(hunks))
+	}
+
+	diff := `@@ -10,3 +10,4 @@
+ func greet() {
+-	return "hello"
++	// new greeting
++	return "hello world"
+ }`
+
+	hunks := highlightDiff("greet.go", diff)
+	if len(hunks) != 1 {
+		t.Fatalf("expected 1 hunk, got %d", len(hunks))
+	}
+	h := hunks[0]
+	if h.OldStart != 10 || h.NewStart != 10 {
+		t.Fatalf("unexpected hunk starts: old=%d new=%d", h.OldStart, h.NewStart)
+	}
+	if len(h.Rows) != 5 {
+		t.Fatalf("expected 5 rows, got %d", len(h.Rows))
+	}
+
+	// Row 0: ctx (func greet() {)
+	if h.Rows[0].Type != "ctx" || h.Rows[0].Text != "\tfunc greet() {" && !strings.Contains(h.Rows[0].HTML, "class=k") {
+		t.Errorf("row 0 missing keyword class: %s", h.Rows[0].HTML)
+	}
+
+	// Row 1: del (return "hello")
+	if h.Rows[1].Type != "del" || h.Rows[1].OldLine != 11 || h.Rows[1].At != 11 {
+		t.Errorf("row 1 incorrect line numbers: %+v", h.Rows[1])
+	}
+	if !strings.Contains(h.Rows[1].HTML, "class=s") {
+		t.Errorf("row 1 missing string class: %s", h.Rows[1].HTML)
+	}
+
+	// Row 2: add (// new greeting)
+	if h.Rows[2].Type != "add" || h.Rows[2].NewLine != 11 {
+		t.Errorf("row 2 incorrect line numbers: %+v", h.Rows[2])
+	}
+	if !strings.Contains(h.Rows[2].HTML, "class=c") {
+		t.Errorf("row 2 missing comment class: %s", h.Rows[2].HTML)
+	}
+
+	// Row 3: add (return "hello world")
+	if h.Rows[3].Type != "add" || h.Rows[3].NewLine != 12 {
+		t.Errorf("row 3 incorrect line numbers: %+v", h.Rows[3])
+	}
+	if !strings.Contains(h.Rows[3].HTML, "class=k") || !strings.Contains(h.Rows[3].HTML, "class=s") {
+		t.Errorf("row 3 missing keyword or string class: %s", h.Rows[3].HTML)
+	}
+}
+

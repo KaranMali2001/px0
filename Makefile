@@ -28,6 +28,8 @@ help:
 	@echo "  make build             - build px0 binary for current platform (optional: POSTHOG_KEY=phc_...)"
 	@echo "  make web               - bundle web assets (JS/CSS/themes)"
 	@echo "  make test              - run go test suite"
+	@echo "  make test-short        - run fast unit tests (short mode)"
+	@echo "  make check             - bundle web assets and run fast test suite"
 	@echo "  make dist              - compile cross-platform binaries into dist/"
 	@echo "  make publish <version> - bump VERSION, commit, tag, and build dist binaries"
 	@echo "  make desktop           - build native macOS .app with Wails"
@@ -47,10 +49,21 @@ build: web
 	@echo "Built ./px0 ($$(du -h px0 | cut -f1))"
 
 test: web
-	go test -v ./...
+	go test -v .
 
-dist: web
-	@./build.sh
+web-check:
+	@node ./scripts/check-web.js
+
+test-short:
+	go test -short .
+
+check: web-check web test-short
+
+bench:
+	go test -bench=. -benchmem -run=^$$ .
+
+benchmark: build
+	./benchmark.sh
 
 publish:
 	@if [ -z "$(CLEAN_VERSION)" ]; then \
@@ -108,5 +121,6 @@ install-desktop: desktop ## install the native app for px0 -d
 install-local: install-cli install-desktop ## install the local native workflow
 
 clean:
-	rm -f px0
+	rm -f px0 web/app.js
+	touch web/app.js
 	rm -rf dist/ build/bin/

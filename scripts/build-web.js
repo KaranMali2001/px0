@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import zlib from 'node:zlib';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,7 +36,8 @@ function buildWithBun() {
     entryFile,
     `--outfile=${outFile}`,
     '--target=browser',
-    '--format=iife'
+    '--format=iife',
+    '--minify'
   ], {
     cwd: rootDir,
     stdio: 'inherit'
@@ -115,6 +117,27 @@ function buildWithNode() {
   fs.writeFileSync(outFile, combined, 'utf8');
 }
 
+/**
+ * Pre-compresses vendor minified JS assets with gzip to keep the compiled Go
+ * binary small. Replaces uncompressed .min.js files with .min.js.gz.
+ */
+function compressVendorAssets() {
+  const vendorDir = path.join(rootDir, 'web', 'vendor');
+  if (!fs.existsSync(vendorDir)) return;
+  const files = fs.readdirSync(vendorDir);
+  for (const file of files) {
+    if (file.endsWith('.min.js')) {
+      const fullPath = path.join(vendorDir, file);
+      const gzPath = fullPath + '.gz';
+      const content = fs.readFileSync(fullPath);
+      const compressed = zlib.gzipSync(content, { level: 9 });
+      fs.writeFileSync(gzPath, compressed);
+      fs.unlinkSync(fullPath);
+      console.log(`[build-web] Compressed ${path.relative(rootDir, fullPath)} -> ${path.relative(rootDir, gzPath)} (${(content.length / 1024 / 1024).toFixed(2)} MB -> ${(compressed.length / 1024 / 1024).toFixed(2)} MB)`);
+    }
+  }
+}
+
 function run() {
   const start = Date.now();
   if (hasBun()) {
@@ -122,6 +145,7 @@ function run() {
   } else {
     buildWithNode();
   }
+  compressVendorAssets();
 
   const stat = fs.statSync(outFile);
   const sizeKb = (stat.size / 1024).toFixed(1);
