@@ -1,5 +1,5 @@
 // web/src/renderer.js
-import { $, S, doc_, api, esc, persistPreference, LH, CHUNK, OVERSCAN } from './state.js';
+import { $, S, doc_, api, esc, LH, CHUNK, OVERSCAN } from './state.js';
 import { vp, sizer, rowsEl, editor } from './ui.js';
 
 export function measure() {
@@ -20,10 +20,10 @@ export function layout() {
   rowsEl.style.width = w + 'px';
 }
 
-export function toggleWordWrap(forced, persist = forced === undefined) {
+export function toggleWordWrap(forced) {
   S.wrap = typeof forced === 'boolean' ? forced : !S.wrap;
   document.body.classList.toggle('word-wrap', S.wrap);
-  if (persist) persistPreference('editor.wordWrap', S.wrap ? 'on' : 'off').catch(() => {});
+  try { localStorage.setItem('px0.wrap', S.wrap ? 'true' : 'false'); } catch {}
   updateEditorOptionControls();
   layout();
   render();
@@ -56,37 +56,25 @@ export function updateEditorOptionControls() {
 }
 
 let raf = 0;
-let lastViewport = '';
-let forceRender = false;
-export function render(force = true) {
-  forceRender ||= force;
+export function render() {
   if (raf) return;
-  raf = requestAnimationFrame(() => {
-    raf = 0;
-    paint(forceRender);
-    forceRender = false;
-  });
+  raf = requestAnimationFrame(() => { raf = 0; paint(); });
 }
 
-export function paint(force = true) {
+export function paint() {
   const d = doc_();
   if (!d) { const c = $('#caret'); if (c) c.hidden = true; return; }
   const top = vp.scrollTop;
   const first = Math.max(0, Math.floor(top / LH) - OVERSCAN);
   const count = Math.ceil(vp.clientHeight / LH) + OVERSCAN * 2;
   const last = Math.min(d.total, first + count);
-  const viewport = d.path + ':' + first + ':' + last;
-  if (!force && viewport === lastViewport) return;
   ensureChunks(d, first, last);
 
-  const sel = saveSelection();
+  let html = '';
   const gut = d.gutter || null;
   const agentRanges = (S.agentTargets || []).filter(t => t.path === d.path);
-  const live = new Map([...rowsEl.children].map(row => [+row.dataset.l, row]));
-  const wanted = new Set();
   for (let i = first; i < last; i++) {
     const n = i + 1;
-    wanted.add(n);
     const body = d.lines[i];
     let rc = 'row', gc = 'g';
     if (n === d.cur) rc += ' cur';
@@ -97,32 +85,24 @@ export function paint(force = true) {
       if (m) gc += m === 'add' ? ' gut-add' : ' gut-mod';
       if (gut.dels.has(n)) rc += ' gut-del';
     }
-    let row = live.get(n);
-    if (!row || force) {
-      if (!row) {
-        row = document.createElement('div');
-        row.dataset.l = n;
-      }
-      row.className = rc;
-      row.innerHTML = '<div class="' + gc + '"><span class="line-btn" role="button" data-l="' + n + '" title="Thread and line actions">Edit</span>' + n + '</div><div class="c">' + (body === undefined ? '' : body) + '</div>';
-    }
-    const at = rowsEl.children[i - first];
-    if (at !== row) rowsEl.insertBefore(row, at || null);
+    html += '<div class="' + rc + '" data-l="' + n + '">' +
+      '<div class="' + gc + '"><span class="line-btn" role="button" data-l="' + n + '" title="Thread and line actions">Edit</span>' + n + '</div><div class="c">' + (body === undefined ? '' : body) + '</div></div>';
   }
-  for (const row of [...rowsEl.children]) if (!wanted.has(+row.dataset.l)) row.remove();
+  const sel = saveSelection();
   rowsEl.style.transform = 'translateY(' + (first * LH) + 'px)';
+  rowsEl.innerHTML = html;
   rowsEl.classList.toggle('all', S.selAll === d);
-  decorate(first, last, force);
+  decorate(first, last);
   if (sel) restoreSelection(sel);
   placeCaret();
-  lastViewport = viewport;
 }
 
 let caretKey = '';
 
 /* Position the caret at d.cur / d.col (UTF-16 units into the line's text,
-   clamped to its length). It lives in #sizer so recycled rows cannot disturb it.
-   Returns the caret's x within #sizer, or null if hidden. */
+   clamped to its length). It lives in #sizer rather than inside a row: rows are
+   rewritten on every paint, and their text nodes are what selection restore and
+   word lookup measure. Returns the caret's x within #sizer, or null if hidden. */
 export function placeCaret() {
   const el = $('#caret');
   if (!el) return null;
@@ -132,32 +112,26 @@ export function placeCaret() {
   const code = $('.c', row);
   if (!code) { el.hidden = true; return null; }
   const col = Math.max(0, Math.min(d.col || 0, code.textContent.length));
+  const [node, off] = toPoint({ line: d.cur, col });
+  const base = sizer.getBoundingClientRect();
   let x, y;
-  const text = code.textContent;
-  const gutter = String(d.total).length * S.chW + 30;
-  if (!S.wrap && !/[\t\x80-\uffff]/.test(text)) {
-    x = gutter + col * S.chW;
-    y = (d.cur - 1) * LH;
-    if (x < vp.scrollLeft + gutter - 1) { el.hidden = true; return null; }
+  if (node.nodeType === 3) {
+    const r = document.createRange();
+    r.setStart(node, off);
+    r.collapse(true);
+    const rect = r.getClientRects()[0] || r.getBoundingClientRect();
+    x = rect.left;
+    // Wrapped rows are taller than one line; otherwise pin to the row's top.
+    y = S.wrap ? rect.top - (LH - rect.height) / 2 : row.getBoundingClientRect().top;
   } else {
-    const [node, off] = toPoint({ line: d.cur, col });
-    const base = sizer.getBoundingClientRect();
-    if (node.nodeType === 3) {
-      const r = document.createRange();
-      r.setStart(node, off);
-      r.collapse(true);
-      const rect = r.getClientRects()[0] || r.getBoundingClientRect();
-      x = rect.left - base.left;
-      y = S.wrap ? rect.top - base.top - (LH - rect.height) / 2 : row.getBoundingClientRect().top - base.top;
-    } else {
-      const cr = code.getBoundingClientRect();
-      x = cr.left - base.left + parseFloat(getComputedStyle(code).paddingLeft || '0');
-      y = cr.top - base.top;
-    }
-    const g = $('.g', row);
-    if (g && x + base.left < g.getBoundingClientRect().right - 1) { el.hidden = true; return null; }
+    const cr = code.getBoundingClientRect();
+    x = cr.left + parseFloat(getComputedStyle(code).paddingLeft || '0');
+    y = cr.top;
   }
-  el.style.transform = 'translate(' + x + 'px,' + y + 'px)';
+  // Scrolled horizontally under the sticky gutter: hide rather than draw over it.
+  const g = $('.g', row);
+  if (g && x < g.getBoundingClientRect().right - 1) { el.hidden = true; return null; }
+  el.style.transform = 'translate(' + (x - base.left) + 'px,' + (y - base.top) + 'px)';
   el.hidden = false;
   const key = d.path + ':' + d.cur + ':' + col;
   if (key !== caretKey) {
@@ -166,7 +140,7 @@ export function placeCaret() {
     void el.offsetWidth; // restart the blink so a moving caret stays solid
     el.classList.add('blink');
   }
-  return x;
+  return x - base.left;
 }
 
 /* Rewriting the rows destroys any live DOM selection, and paint runs on far
@@ -226,27 +200,25 @@ export function toPoint({ line, col }) {
 }
 
 /* Decorations are applied to the ~60 live rows only, never to the whole file. */
-export function decorate(first, last, force = true) {
+export function decorate(first, last) {
   const d = doc_();
-  const rows = force ? rowsEl.children : [...rowsEl.children].filter(row => !row.dataset.decorated);
   if (S.occ) {
-    for (const row of rows) markNodes($('.c', row), S.occ, true, 'occ');
+    for (const row of rowsEl.children) markNodes($('.c', row), S.occ, true, 'occ');
   }
   if (S.link) {
     const row = rowFor(S.link.line);
-    if (row && (force || !row.dataset.decorated)) wrapRange($('.c', row), S.link.col, S.link.col + S.link.word.length, 'link');
+    if (row) wrapRange($('.c', row), S.link.col, S.link.col + S.link.word.length, 'link');
   }
   if (S.find && S.find.hits.length) {
     const byLine = S.find.byLine;
     const act = S.find.hits[S.find.active];
-    for (const row of rows) {
+    for (const row of rowsEl.children) {
       const n = +row.dataset.l;
       if (!byLine.has(n)) continue;
       const marks = markNodes($('.c', row), S.find.q, S.find.cs, 'mark');
       if (act && act.line === n && marks[act.n]) marks[act.n].classList.add('on');
     }
   }
-  for (const row of rows) row.dataset.decorated = '1';
   void first; void last;
 }
 
@@ -359,6 +331,6 @@ export function refineChunk(d, c, delay = 800, tries = 0) {
 }
 
 export function initRenderer() {
-  vp.addEventListener('scroll', () => render(false), { passive: true });
+  vp.addEventListener('scroll', render, { passive: true });
   new ResizeObserver(() => { layout(); render(); }).observe(editor);
 }

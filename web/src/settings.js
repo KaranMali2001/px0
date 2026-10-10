@@ -375,7 +375,7 @@ export function applySettingLive(key, val) {
     }
     case 'editor.wordWrap': {
       const on = val === 'on' || val === true;
-      toggleWordWrap(on, false);
+      toggleWordWrap(on);
       break;
     }
     case 'editor.lineNumbers': {
@@ -421,11 +421,12 @@ export function applySettingLive(key, val) {
     }
     case 'diffEditor.renderSideBySide': {
       const split = val === true || val === 'true';
-      setLayoutPref(split ? 'split' : 'unified', false);
+      setLayoutPref(split ? 'split' : 'unified');
       break;
     }
     case 'markdown.preview.open': {
       S.mdPreview = val === true || val === 'true';
+      try { localStorage.setItem('px0.mdPreview', S.mdPreview ? 'true' : 'false'); } catch {}
       break;
     }
     case 'table.preview.open': {
@@ -842,7 +843,6 @@ function setSaveStatus(state, msg) {
 }
 
 async function handleSettingChange(key, value) {
-  const previous = settingsData.settings?.[key];
   // Update state locally
   if (!settingsData.settings) settingsData.settings = {};
   settingsData.settings[key] = value;
@@ -859,10 +859,6 @@ async function handleSettingChange(key, value) {
     if (res.raw) settingsData.raw = res.raw;
     setSaveStatus('saved', 'All changes saved');
   } catch (err) {
-    settingsData.settings[key] = previous;
-    applySettingLive(key, previous);
-    renderSettingsList();
-    showToast('!', 'Could not save ' + key + ': ' + err.message, 5000);
     console.error(`Failed to save setting ${key}:`, err);
     setSaveStatus('error', 'Failed to save: ' + (err.message || 'unknown error'));
   }

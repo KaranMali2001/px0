@@ -1,5 +1,5 @@
 // web/src/markdown.js
-import { $, $$, S, doc_, esc, api, isMac, MOD, LH, persistPreference } from './state.js';
+import { $, $$, S, doc_, esc, api, isMac, MOD, LH } from './state.js';
 import { on } from './bus.js';
 import { vp, rowsEl, copyToClipboard, showToast } from './ui.js';
 import { render, paint, rowFor, markNodes } from './renderer.js';
@@ -134,7 +134,6 @@ function mdSetPref(d, on) {
   const table = previewKind(d) === 'table';
   if (table) S.tablePreview = on; else S.mdPreview = on;
   try { localStorage.setItem(table ? 'px0.tablePreview' : 'px0.mdPreview', on ? 'true' : 'false'); } catch {}
-  persistPreference(table ? 'table.preview.open' : 'markdown.preview.open', on).catch(() => {});
 }
 
 /* ---------- sanitising ---------- */

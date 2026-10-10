@@ -53,6 +53,15 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 | `settings.go`, `web/src/settings.js` | `workbench.sideBar.{location,width,visible}` settings | Reverted to upstream (`settings.go` byte-identical) | New shared settings, not desktop integration |
 | `web/src/panels.js`, `web/src/palette.js`, `web/src/shortcuts.js` | `setSidebarLocation`/`setSidebarVisible`/`toggleSidebar`, persisted width, right-side dragging | Reverted to upstream (byte-identical) | Shared behaviour; went with the sidebar settings |
 | `settings_test.go` | `TestSettingsAcceptsTrustedDesktopRequest` | Keep (sidebar assertions removed) | Tests the desktop trust path only |
+| `web/src/{state,renderer,diff,vim,markdown,settings}.js` | `persistPreference` (word wrap, diff layout, vim mode, preview state saved to `settings.json` instead of localStorage); settings save rollback + toast | Reverted to upstream | Shared persistence behaviour, not desktop integration |
+| `web/src/renderer.js` | Row recycling (`render(force)`/`paint(force)`), arithmetic caret placement | Reverted to upstream (byte-identical) | Shared rendering optimisation |
+| `web/src/tabs.js` | `openFile` boolean result, `[px0 open]` console logging | Reverted to upstream (byte-identical) | Debug output; nothing used the result |
+| `web/src/main.js` | Meta-poll exponential backoff | Reverted to upstream (byte-identical) | Shared behaviour |
+| `web/src/state.js` | `request()` catches a non-JSON body and throws `<METHOD> <path> failed (<status>)` | Keep (upstream bug fix) | Upstream's `http.NotFound` and other plain-text replies made `r.json()` throw an opaque `SyntaxError`; JSON responses behave exactly as upstream |
+| `highlight.go`, `highlight_test.go` | TypeScript method-declaration highlighting | Reverted to upstream (byte-identical) | Shared highlighting change |
+| `lspsetup.go` | `localPost` accepts `isTrustedDesktopRequest` | Keep (desktop-gated) | The Wails origin is not `localhost`/an IP; CLI requests never carry the marker |
+| `git.go`, `git_test.go` | `gitQuery` bounds `gitProbe`/`gitHeadCommit` with a 5s timeout; tests resolve `/var` → `/private/var` | Keep (bug fixes) | A child `git rev-parse` can block forever (macOS TCC); upstream tests fail on macOS temp dirs |
+| `main.go`, `version.go`, `target.go`, `desktop*.go`, `webview_fps_darwin.go` | `!desktop` build tag, `-d` flag, helpers split out for the desktop build | Keep (desktop integration) | `-d` only launches the app; other CLI paths are upstream's code |
 
 ## Desktop startup
 
@@ -65,5 +74,3 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.
 - `go vet -tags desktop .` fails on `px0_test.go` (uses `listen` from `!desktop` `main.go`). This was already the case in `b8e3012`. Only the non-tagged vet/test plus `go build -tags desktop` are required.
 - Desktop loads only the bundled JetBrains Mono (400, 400 italic, 500, 700); upstream's Google Fonts request asks for 600 instead of 700, so desktop semibold text uses the nearest bundled weight.
-- The `[px0 open]` console logging from the desktop snapshot was kept as-is. It looks like debugging output and may be worth removing.
-- Desktop row recycling in `renderer.js` was not checked against upstream's line-thread markers in a running app. The GUI was not launched.

@@ -79,7 +79,6 @@ export async function openFile(path, opts = {}) {
   const wantsSource = view === 'source';
 
   let idx = S.tabs.findIndex(t => t.path === path);
-  console.info('[px0 open] start', { path, cached: idx >= 0, line });
   if (idx >= 0 && (S.tabs[idx].diffRef || '') !== ref) {
     /* Same tab, different revision. Drop the cached diff and let loadGutter
        re-decide: the file may have a diff at the commit and none in the
@@ -99,11 +98,9 @@ export async function openFile(path, opts = {}) {
     const start = line ? Math.max(0, Math.floor((line - 1) / CHUNK) * CHUNK) : 0;
     try {
       j = await api('/api/file', { path, start, count: CHUNK, ref });
-      console.info('[px0 open] loaded', { path, total: j.total, image: !!j.image });
     } catch (e) {
-      console.error('[px0 open] failed', { path, error: e.message });
       setStatusNote(path + ': ' + e.message, 4000);
-      return false;
+      return;
     }
     const isImg = !!j.image;
     const hasDiff = !isImg && !!j.diffAvailable;
@@ -197,8 +194,6 @@ export async function openFile(path, opts = {}) {
   if (push) pushHistory(path, line || d.cur);
   saveWorkspaceState();
   emit('tab:activated', { doc: d, prevDoc: prev });
-  console.info('[px0 open] active', { path: d.path, tabs: S.tabs.length });
-  return true;
 }
 
 // VS Code-style diff gutter for the normal file view. Fetches once per opened

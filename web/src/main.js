@@ -167,26 +167,22 @@ initPRScope();
   // If the background indexer was still running when the UI loaded, poll briefly
   // until complete to update the total file count and index time in the status bar.
   if (S.meta && !S.meta.ready) {
-    let delay = 150;
-    const poll = async () => {
+    const timer = setInterval(async () => {
       try {
         const m = await api('/api/meta');
         if (m.ready) {
+          clearInterval(timer);
           S.meta = m;
           updateStatus();
           if (!initialPath) {
             hasGitChanges = await applyGitSidebarState();
             if (hasGitChanges) await selectChangedFileTab();
           }
-          return;
         }
       } catch {
-        return;
+        clearInterval(timer);
       }
-      delay = Math.min(delay * 2, 1000);
-      setTimeout(poll, delay);
-    };
-    setTimeout(poll, delay);
+    }, 150);
   }
 
   // Load harnesses and models asynchronously after the browser is loaded.
