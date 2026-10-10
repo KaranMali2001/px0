@@ -45,6 +45,11 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 | `web/index.html` | `wails:` class script; favicons/logos from `static/static/...` | Reverted to upstream; desktop rewrite moved to `desktopIndex` | Offline assets are desktop integration; CLI keeps upstream's remote URLs |
 | `server.go` | `web/static` embed, `trustedDesktopRequest`, `desktopIndex` | Keep (desktop-gated) | Only reachable from the Wails handler; the extra embedded files are unused by the CLI page |
 | `build/darwin/Info.plist`, `Info.dev.plist` | `NS{Desktop,Documents,Downloads}FolderUsageDescription`, `NS{Removable,Network}VolumesUsageDescription` | Added | macOS shows these when px0 reads a protected folder; bundle id unchanged |
+| `web/src/tree.js` | SVG file-type/folder icons, special filename kinds, select-after-open with `.loading` | Reverted to upstream | Shared appearance/behaviour, not desktop-specific |
+| `web/style.css` | Vendored `@font-face` rules | Moved to `web/static/fonts/fonts.css`; `desktopIndex` swaps the Google Fonts link for it | Offline fonts are desktop integration; CLI keeps upstream's Google Fonts |
+| `web/style.css` | Traffic-light inset and drag region on `#side header.panel-head`; `#main`/`#view-switches`/`#tabs` insets | Keep, under `html.desktop` | Wails hidden-inset titlebar |
+| `web/style.css` | "Apple-native polish" (translucent status/sidebar, button press scale, modal transitions, tracking, reduced-motion/transparency), `.row { contain: content }`, tree icon/loading styles | Reverted to upstream | Shared appearance tweaks, not desktop integration |
+| `web/style.css` | `body.side-right` layout | Pending (tied to the sidebar-location setting in `panels.js`/`settings.js`) | Decide with those files |
 
 ## Desktop startup
 
@@ -56,6 +61,6 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 
 - `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.
 - `go vet -tags desktop .` fails on `px0_test.go` (uses `listen` from `!desktop` `main.go`). This was already the case in `b8e3012`. Only the non-tagged vet/test plus `go build -tags desktop` are required.
-- Both Google Fonts (upstream) and the vendored JetBrains Mono `@font-face` rules load. Offline (desktop) uses the local files.
+- Desktop loads only the bundled JetBrains Mono (400, 400 italic, 500, 700); upstream's Google Fonts request asks for 600 instead of 700, so desktop semibold text uses the nearest bundled weight.
 - The `[px0 open]` console logging from the desktop snapshot was kept as-is. It looks like debugging output and may be worth removing.
 - Desktop row recycling in `renderer.js` was not checked against upstream's line-thread markers in a running app. The GUI was not launched.

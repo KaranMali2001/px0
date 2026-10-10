@@ -91,7 +91,10 @@ func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 	if !strings.Contains(desk, `<html class="desktop" lang="en"`) {
 		t.Fatal("desktop index missing html.desktop marker")
 	}
-	if strings.Contains(desk, "https://px0.ai/favicon") || strings.Contains(desk, "https://px0.ai/logo/") {
-		t.Fatal("desktop index still loads remote favicons/logos")
+	if strings.Contains(desk, "https://px0.ai/favicon") || strings.Contains(desk, "https://px0.ai/logo/") || strings.Contains(desk, "fonts.googleapis.com/css2") {
+		t.Fatal("desktop index still loads remote fonts/favicons/logos")
+	}
+	if css := get(httptest.NewRequest(http.MethodGet, "/static/static/fonts/fonts.css", nil)); !strings.Contains(css, "JetBrainsMono-Regular.woff2") {
+		t.Fatal("bundled font stylesheet not served")
 	}
 }

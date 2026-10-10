@@ -646,12 +646,13 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 // desktopIndex marks the page for html.desktop CSS/JS and points remote
-// favicons and logos at the embedded copies so the app works offline.
+// fonts, favicons and logos at the embedded copies so the app works offline.
 func desktopIndex(html string) string {
 	return strings.NewReplacer(
 		`<html lang="en"`, `<html class="desktop" lang="en"`,
 		`"https://px0.ai/favicon`, `"static/static/favicon`,
 		`"https://px0.ai/logo/`, `"static/static/logo/`,
+		`"https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap"`, `"static/static/fonts/fonts.css"`,
 	).Replace(html)
 }
 
