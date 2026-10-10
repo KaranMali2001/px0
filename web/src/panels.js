@@ -1,5 +1,5 @@
 // web/src/panels.js
-import { $, $$, S, api, persistPreference } from './state.js';
+import { $, $$, S, api } from './state.js';
 import { layout, render } from './renderer.js';
 import { updateStatus } from './status.js';
 import { loadOutline } from './outline.js';
@@ -9,33 +9,12 @@ import { showToast } from './ui.js';
 import { refreshUnpushed } from './unpushed.js';
 
 export async function showPanel(name) {
-  setSidebarVisible(true);
+  document.body.classList.remove('side-hidden');
   if (name === 'files') {
     await setSidebarMode('files');
   }
-}
-
-export function setSidebarLocation(location) {
-  document.body.classList.toggle('side-right', location === 'right');
   layout();
   render();
-}
-
-export function setSidebarVisible(visible, persist = false) {
-  document.body.classList.toggle('side-hidden', !visible);
-  if (persist) persistPreference('workbench.sideBar.visible', visible).catch(() => {});
-  layout();
-  render();
-}
-
-export function toggleSidebar() {
-  setSidebarVisible(document.body.classList.contains('side-hidden'), true);
-}
-
-function setSidebarWidth(width, persist = false) {
-  const next = Math.max(170, Math.min(620, Math.round(width)));
-  $('#side').style.width = next + 'px';
-  if (persist) persistPreference('workbench.sideBar.width', next).catch(() => {});
 }
 
 export async function reindexWorkspace() {
@@ -72,15 +51,8 @@ export function initPanels() {
     rz.addEventListener('mousedown', e => { dragging = true; rz.classList.add('drag'); e.preventDefault(); });
     addEventListener('mousemove', e => {
       if (!dragging) return;
-      setSidebarWidth(document.body.classList.contains('side-right') ? window.innerWidth - e.clientX : e.clientX);
+      $('#side').style.width = Math.max(170, Math.min(620, e.clientX)) + 'px';
     });
-    addEventListener('mouseup', () => {
-      if (!dragging) return;
-      dragging = false;
-      rz.classList.remove('drag');
-      setSidebarWidth(parseFloat($('#side').style.width), true);
-      layout();
-      render();
-    });
+    addEventListener('mouseup', () => { if (dragging) { dragging = false; rz.classList.remove('drag'); layout(); render(); } });
   })();
 }

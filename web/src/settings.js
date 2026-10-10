@@ -6,7 +6,6 @@ import { setTheme, listThemes } from './theme.js';
 import { chooseThemePreference, DEFAULT_THEME } from './theme-preference.js';
 import { setLayoutPref } from './diff.js';
 import { setVimModeEnabled, showVimHelp } from './vim.js';
-import { setSidebarLocation, setSidebarVisible } from './panels.js';
 
 export let settingsModalEl = null;
 const BUILTIN_SCHEMA = [
@@ -159,34 +158,6 @@ const BUILTIN_SCHEMA = [
     ]
   },
   {
-    key: "workbench.sideBar.location",
-    title: "Sidebar Location",
-    description: "Controls whether the file explorer appears on the left or right.",
-    category: "Workbench",
-    type: "select",
-    default: "left",
-    options: ["left", "right"]
-  },
-  {
-    key: "workbench.sideBar.width",
-    title: "Sidebar Width",
-    description: "Controls the width of the file explorer in pixels.",
-    category: "Workbench",
-    type: "number",
-    default: 340,
-    min: 170,
-    max: 620,
-    step: 1
-  },
-  {
-    key: "workbench.sideBar.visible",
-    title: "Sidebar Visible",
-    description: "Controls whether the file explorer is visible when px0 opens.",
-    category: "Workbench",
-    type: "boolean",
-    default: true
-  },
-  {
     key: "diffEditor.renderSideBySide",
     title: "Diff Side By Side",
     description: "Controls whether the diff editor shows changes in split (side-by-side) or unified mode.",
@@ -336,7 +307,6 @@ let settingsFilterQuery = '';
 const COMMONLY_USED_KEYS = new Set([
   'editor.fontSize',
   'workbench.colorTheme',
-  'workbench.sideBar.location',
   'editor.wordWrap',
   'editor.lineNumbers',
   'editor.vimMode',
@@ -447,19 +417,6 @@ export function applySettingLive(key, val) {
       const storedTheme = localStorage.getItem('px0.theme');
       const nextTheme = chooseThemePreference(storedTheme, val, DEFAULT_THEME);
       if (nextTheme) setTheme(nextTheme, false);
-      break;
-    }
-    case 'workbench.sideBar.location': {
-      setSidebarLocation(val === 'right' ? 'right' : 'left');
-      break;
-    }
-    case 'workbench.sideBar.width': {
-      const width = Math.max(170, Math.min(620, Number(val) || 340));
-      $('#side').style.width = width + 'px';
-      break;
-    }
-    case 'workbench.sideBar.visible': {
-      setSidebarVisible(val !== false && val !== 'false');
       break;
     }
     case 'diffEditor.renderSideBySide': {

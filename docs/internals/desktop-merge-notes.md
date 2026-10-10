@@ -49,7 +49,10 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 | `web/style.css` | Vendored `@font-face` rules | Moved to `web/static/fonts/fonts.css`; `desktopIndex` swaps the Google Fonts link for it | Offline fonts are desktop integration; CLI keeps upstream's Google Fonts |
 | `web/style.css` | Traffic-light inset and drag region on `#side header.panel-head`; `#main`/`#view-switches`/`#tabs` insets | Keep, under `html.desktop` | Wails hidden-inset titlebar |
 | `web/style.css` | "Apple-native polish" (translucent status/sidebar, button press scale, modal transitions, tracking, reduced-motion/transparency), `.row { contain: content }`, tree icon/loading styles | Reverted to upstream | Shared appearance tweaks, not desktop integration |
-| `web/style.css` | `body.side-right` layout | Pending (tied to the sidebar-location setting in `panels.js`/`settings.js`) | Decide with those files |
+| `web/style.css` | `body.side-right` layout and its `html.desktop` insets | Reverted to upstream | Part of the sidebar-location setting below |
+| `settings.go`, `web/src/settings.js` | `workbench.sideBar.{location,width,visible}` settings | Reverted to upstream (`settings.go` byte-identical) | New shared settings, not desktop integration |
+| `web/src/panels.js`, `web/src/palette.js`, `web/src/shortcuts.js` | `setSidebarLocation`/`setSidebarVisible`/`toggleSidebar`, persisted width, right-side dragging | Reverted to upstream (byte-identical) | Shared behaviour; went with the sidebar settings |
+| `settings_test.go` | `TestSettingsAcceptsTrustedDesktopRequest` | Keep (sidebar assertions removed) | Tests the desktop trust path only |
 
 ## Desktop startup
 
