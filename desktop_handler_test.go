@@ -98,3 +98,54 @@ func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 		t.Fatal("bundled font stylesheet not served")
 	}
 }
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestServerCloseIdempotentStopsWatcher(t *testing.T) {
+	srv := agentServer(t, t.TempDir(), "echo")
+	srv.Close()
+	srv.Close()
+	if !isClosed(srv.gitWatcher.stopCh) {
+		t.Fatal("git watcher still running after Close")
+	}
+	if !isClosed(srv.done) {
+		t.Fatal("scavenger not signalled")
+	}
+}
+
+func TestDeskHandlerSwapClosesOldAndWrapsRequests(t *testing.T) {
+	h := newDeskHandler()
+	h.openAsync(func() string { return "" }, nil)
+	<-h.ready
+
+	a := agentServer(t, t.TempDir(), "echo")
+	b := agentServer(t, t.TempDir(), "echo")
+	h.install(a)
+	h.install(b)
+	select {
+	case <-a.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old server not closed after swap")
+	}
+	if isClosed(b.done) {
+		t.Fatal("active server closed")
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `<html class="desktop"`) {
+		t.Fatalf("desktop request not served as trusted: %d", rec.Code)
+	}
+
+	h.shutdown()
+	if !isClosed(b.done) || h.cur.Load() != nil {
+		t.Fatal("shutdown left the workspace open")
+	}
+}

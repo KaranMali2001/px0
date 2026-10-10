@@ -62,15 +62,17 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 | `lspsetup.go` | `localPost` accepts `isTrustedDesktopRequest` | Keep (desktop-gated) | The Wails origin is not `localhost`/an IP; CLI requests never carry the marker |
 | `git.go`, `git_test.go` | `gitQuery` bounds `gitProbe`/`gitHeadCommit` with a 5s timeout; tests resolve `/var` → `/private/var` | Keep (bug fixes) | A child `git rev-parse` can block forever (macOS TCC); upstream tests fail on macOS temp dirs |
 | `main.go`, `version.go`, `target.go`, `desktop*.go`, `webview_fps_darwin.go` | `!desktop` build tag, `-d` flag, helpers split out for the desktop build | Keep (desktop integration) | `-d` only launches the app; other CLI paths are upstream's code |
+| `main.go` → `listen.go` | `viewerURL`, `networkURLs`, `networkURLsFromAddrs`, `listen` moved unchanged into an untagged file | Keep (move only) | `px0_test.go` uses them, so `go vet/test -tags desktop ./...` now compile and pass |
+| `server.go` | `Server.Close()` (stops the git watcher and scavenger, `CloseThreads`, `agent.Close`, `lsp.Close`; idempotent) | Keep | Only the desktop app calls it; CLI shutdown in `main.go` is unchanged |
 
 ## Desktop startup
 
 - `main()` (`desktop.go`) resolves and opens the startup workspace on a goroutine (`deskHandler.openAsync`), so `wails.Run` and the window never wait on `startupRoot`/`NewIndex`/`NewServer`/git work. The folder picker in `OnStartup` waits for that open to finish. A launch from a privacy-protected folder (e.g. `~/Desktop`) used to hang forever with no window because a child `git rev-parse` blocked before `wails.Run`.
 - `deskHandler` (`desktop_handler.go`) holds webview requests until that open finishes (capped by `deskOpenWait`, 30s), so the unchanged web UI boots against a ready server. If a request gives up, it gets the existing 503 `no workspace open` and the window reloads once the open completes.
+- Opening another folder swaps the active server (`deskHandler.install`) and closes the old one on a goroutine, so its git watcher, scavenger, LSP children, agent runs and thread turns stop. `OnShutdown` closes the active server (`deskHandler.shutdown`).
 - Git queries on the open path (`gitProbe`, `gitHeadCommit`) go through `gitQuery`, bounded by `gitQueryTimeout` (5s). A hung git is treated like a non-git folder.
 
 ## Uncertain / follow-ups
 
 - `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.
-- `go vet -tags desktop .` fails on `px0_test.go` (uses `listen` from `!desktop` `main.go`). This was already the case in `b8e3012`. Only the non-tagged vet/test plus `go build -tags desktop` are required.
 - Desktop loads only the bundled JetBrains Mono (400, 400 italic, 500, 700); upstream's Google Fonts request asks for 600 instead of 700, so desktop semibold text uses the nearest bundled weight.

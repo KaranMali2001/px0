@@ -36,6 +36,21 @@ func (h *deskHandler) openAsync(resolve func() string, open func(string)) {
 	}()
 }
 
+// install makes srv the active workspace. The old server is closed off the
+// caller's goroutine because LSP shutdown can take a few seconds.
+func (h *deskHandler) install(srv *Server) {
+	if old := h.cur.Swap(srv); old != nil && old != srv {
+		go old.Close()
+	}
+}
+
+// shutdown closes the active workspace when the app quits.
+func (h *deskHandler) shutdown() {
+	if s := h.cur.Swap(nil); s != nil {
+		s.Close()
+	}
+}
+
 func (h *deskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-h.ready:

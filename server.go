@@ -68,6 +68,9 @@ type Server struct {
 	session    *sessionManager
 
 	lastReq atomic.Int64 // unix nanos of the most recent request
+
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 type desktopRequestKey struct{}
@@ -205,7 +208,7 @@ func NewServer(ix *Index, lsp *lspManager, basePaths ...string) *Server {
 	if len(basePaths) > 0 && basePaths[0] != "" {
 		bp = cleanBasePath(basePaths[0])
 	}
-	s := &Server{ix: ix, lsp: lsp, diffBase: "HEAD", basePath: bp, mux: http.NewServeMux()}
+	s := &Server{ix: ix, lsp: lsp, diffBase: "HEAD", basePath: bp, mux: http.NewServeMux(), done: make(chan struct{})}
 	s.session = newSessionManager(s.basePath, ix.Root())
 	s.gitWatcher = NewGitWatcher(ix)
 	s.gitWatcher.Start(context.Background())
@@ -224,7 +227,12 @@ func (s *Server) scavenge() {
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
 	done := true // nothing to release before the first request
-	for range tick.C {
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-tick.C:
+		}
 		idle := time.Since(time.Unix(0, s.lastReq.Load()))
 		if idle < idleFor {
 			done = false
@@ -2050,6 +2058,19 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		fail(w, 405, "method not allowed")
 	}
+}
+
+// Close stops everything the server started for its workspace: the git
+// watcher, scavenger, thread turns, agent runs and language servers. Safe to
+// call more than once.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+		s.gitWatcher.Stop()
+		s.CloseThreads()
+		s.agent.Close()
+		s.lsp.Close()
+	})
 }
 
 // CloseThreads stops every thread turn still running at shutdown.

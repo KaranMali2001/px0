@@ -28,7 +28,7 @@ func (h *deskHandler) open(root string) {
 	if ag, err := newAgentManager(root, "", lsp); err == nil {
 		srv.SetAgent(ag)
 	}
-	h.cur.Store(srv)
+	h.install(srv)
 	go ix.Build()
 	rememberFolder(root)
 }
@@ -68,7 +68,8 @@ func main() {
 			WindowIsTranslucent:  true,
 			About:                &mac.AboutInfo{Title: "px0", Message: "Read-only code navigator"},
 		},
-		Menu: buildMenu(h),
+		Menu:       buildMenu(h),
+		OnShutdown: func(context.Context) { h.shutdown() },
 		OnStartup: func(ctx context.Context) {
 			enableHighRefreshRate()
 			deskCtx = ctx
