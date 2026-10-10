@@ -51,7 +51,8 @@ export function initPanels() {
     rz.addEventListener('mousedown', e => { dragging = true; rz.classList.add('drag'); e.preventDefault(); });
     addEventListener('mousemove', e => {
       if (!dragging) return;
-      $('#side').style.width = Math.max(170, Math.min(620, e.clientX)) + 'px';
+      const x = document.body.classList.contains('side-right') ? innerWidth - e.clientX : e.clientX;
+      $('#side').style.width = Math.max(170, Math.min(620, x)) + 'px';
     });
     addEventListener('mouseup', () => { if (dragging) { dragging = false; rz.classList.remove('drag'); layout(); render(); } });
   })();

@@ -57,7 +57,7 @@ Use the existing browser workflow with `px0 .`, or open a directory in a new nat
 px0 -d .
 ```
 
-`px0 -d` looks for `~/Applications/px0.app`, then `/Applications/px0.app`. Set `PX0_DESKTOP_APP` to use a different local app bundle. The local app and DMG are unsigned and may show a Gatekeeper warning. `-d` takes a directory only; pull request URLs are not supported.
+`px0 -d` looks for `~/Applications/px0.app`, then `/Applications/px0.app`. Set `PX0_DESKTOP_APP` to use a different local app bundle. The local app and DMG are ad-hoc signed (not notarized) and may show a Gatekeeper warning. Build the app with `make desktop` rather than a bare `wails build`: the Makefile stamps the version from `VERSION` into `Info.plist`, which plain `wails build` leaves at 1.0.0. `-d` takes a directory only; pull request URLs are not supported.
 
 To update an existing installation:
 

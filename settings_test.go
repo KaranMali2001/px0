@@ -253,6 +253,47 @@ func TestSettingsAcceptsTrustedDesktopRequest(t *testing.T) {
 	}
 }
 
+func TestSidebarLocationSettingOnlyForDesktop(t *testing.T) {
+	isolateSettings(t)
+	srv := agentServer(t, t.TempDir(), "echo")
+	get := func(desktop bool) (schema []settingSchemaItem, defaults map[string]any) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+		if desktop {
+			req = trustedDesktopRequest(req)
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		var body struct {
+			Schema   []settingSchemaItem `json:"schema"`
+			Defaults map[string]any      `json:"defaults"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode settings: %v: %s", err, rec.Body.String())
+		}
+		return body.Schema, body.Defaults
+	}
+	has := func(schema []settingSchemaItem) bool {
+		for _, item := range schema {
+			if item.Key == "workbench.sideBar.location" {
+				return true
+			}
+		}
+		return false
+	}
+
+	cliSchema, cliDefaults := get(false)
+	if has(cliSchema) || cliDefaults["workbench.sideBar.location"] != nil || len(cliSchema) != len(settingsSchema) {
+		t.Fatalf("CLI settings expose desktop-only sidebar location")
+	}
+	deskSchema, deskDefaults := get(true)
+	if !has(deskSchema) || deskDefaults["workbench.sideBar.location"] != "left" {
+		t.Fatalf("desktop settings missing sidebar location: defaults=%v", deskDefaults)
+	}
+	if again, _ := get(false); has(again) {
+		t.Fatalf("desktop request leaked sidebar location into the shared schema")
+	}
+}
+
 func TestSettingsBasePath(t *testing.T) {
 	isolateSettings(t)
 

@@ -653,6 +653,20 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, html)
 }
 
+// desktopSettingsSchema lists settings only the desktop app honours, so the
+// CLI settings UI never shows them.
+var desktopSettingsSchema = []settingSchemaItem{
+	{
+		Key:         "workbench.sideBar.location",
+		Title:       "Sidebar Location",
+		Description: "Controls whether the file explorer appears on the left or right.",
+		Category:    "Workbench",
+		Type:        "select",
+		Default:     "left",
+		Options:     []string{"left", "right"},
+	},
+}
+
 // desktopIndex marks the page for html.desktop CSS/JS and points remote
 // fonts, favicons and logos at the embedded copies so the app works offline.
 func desktopIndex(html string) string {
@@ -1999,10 +2013,17 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		schema, defaults := settingsSchema, defaultSettingsMap()
+		if isTrustedDesktopRequest(r) {
+			schema = append(schema[:len(schema):len(schema)], desktopSettingsSchema...)
+			for _, item := range desktopSettingsSchema {
+				defaults[item.Key] = item.Default
+			}
+		}
 		writeJSON(w, map[string]any{
 			"settings": readMergedSettingsMap(),
-			"defaults": defaultSettingsMap(),
-			"schema":   settingsSchema,
+			"defaults": defaults,
+			"schema":   schema,
 			"raw":      readRawSettingsJSON(),
 			"path":     settingsPath(),
 		})

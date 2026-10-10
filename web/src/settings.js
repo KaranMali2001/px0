@@ -1,7 +1,7 @@
 // web/src/settings.js
 import { $, $$, esc, S, api, apiPost, apiPostJson } from './state.js';
 import { showToast } from './ui.js';
-import { applyEditorTypography, toggleWordWrap, toggleLineNumbers } from './renderer.js';
+import { applyEditorTypography, toggleWordWrap, toggleLineNumbers, layout, render } from './renderer.js';
 import { setTheme, listThemes } from './theme.js';
 import { chooseThemePreference, DEFAULT_THEME } from './theme-preference.js';
 import { setLayoutPref } from './diff.js';
@@ -436,6 +436,13 @@ export function applySettingLive(key, val) {
     }
     case 'editor.vimMode': {
       setVimModeEnabled(val === true || val === 'true', false);
+      break;
+    }
+    case 'workbench.sideBar.location': {
+      if (!document.documentElement.classList.contains('desktop')) break;
+      document.body.classList.toggle('side-right', val === 'right');
+      layout();
+      render();
       break;
     }
     case 'explorer.autoReveal':

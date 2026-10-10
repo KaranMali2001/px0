@@ -708,9 +708,19 @@ body.right-hidden #right-side, body.right-hidden #right-resizer { display: none;
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 html.desktop #main { padding-top: 28px; }
 html.desktop #view-switches { top: 31px; }
+html.desktop body.side-right #main,
 html.desktop body.side-hidden #main { padding-top: 40px; }
+html.desktop body.side-right #view-switches,
 html.desktop body.side-hidden #view-switches { top: 43px; }
+html.desktop body.side-right #tabs,
 html.desktop body.side-hidden #tabs { padding-left: 88px; scroll-padding-left: 88px; }
+/* workbench.sideBar.location is a desktop-only setting; side-right is only ever set under html.desktop. */
+html.desktop body.side-right #main { order: 1; }
+html.desktop body.side-right #resizer { order: 2; margin-left: 0; margin-right: -2px; }
+html.desktop body.side-right #side { order: 3; border-right: 0; border-left: 1px solid var(--line); }
+html.desktop body.side-right #right-resizer { order: 4; }
+html.desktop body.side-right #right-side { order: 5; }
+html.desktop body.side-right #side header.panel-head { padding-top: 9px; }
 /* View-mode switches (Markdown Preview/Source, git Diff), pinned to the right
    of the tab bar. The bar pads its end so the last tab can scroll clear of them. */
 .open-right {
