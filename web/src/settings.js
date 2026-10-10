@@ -1,9 +1,11 @@
 // web/src/settings.js
-import { $, $$, esc, S, api, apiPost } from './state.js';
+import { $, $$, esc, S, api, apiPostJSON } from './state.js';
 import { applyEditorTypography, toggleWordWrap, toggleLineNumbers } from './renderer.js';
 import { setTheme, listThemes } from './theme.js';
 import { setLayoutPref } from './diff.js';
 import { setVimModeEnabled, showVimHelp } from './vim.js';
+import { setSidebarLocation, setSidebarVisible } from './panels.js';
+import { showToast } from './ui.js';
 
 export let settingsModalEl = null;
 const BUILTIN_SCHEMA = [
@@ -156,6 +158,34 @@ const BUILTIN_SCHEMA = [
     ]
   },
   {
+    key: "workbench.sideBar.location",
+    title: "Sidebar Location",
+    description: "Controls whether the file explorer appears on the left or right.",
+    category: "Workbench",
+    type: "select",
+    default: "left",
+    options: ["left", "right"]
+  },
+  {
+    key: "workbench.sideBar.width",
+    title: "Sidebar Width",
+    description: "Controls the width of the file explorer in pixels.",
+    category: "Workbench",
+    type: "number",
+    default: 228,
+    min: 170,
+    max: 620,
+    step: 1
+  },
+  {
+    key: "workbench.sideBar.visible",
+    title: "Sidebar Visible",
+    description: "Controls whether the file explorer is visible when px0 opens.",
+    category: "Workbench",
+    type: "boolean",
+    default: true
+  },
+  {
     key: "diffEditor.renderSideBySide",
     title: "Diff Side By Side",
     description: "Controls whether the diff editor shows changes in split (side-by-side) or unified mode.",
@@ -289,6 +319,7 @@ let settingsFilterQuery = '';
 const COMMONLY_USED_KEYS = new Set([
   'editor.fontSize',
   'workbench.colorTheme',
+  'workbench.sideBar.location',
   'editor.wordWrap',
   'editor.lineNumbers',
   'editor.vimMode',
@@ -338,7 +369,7 @@ export function applySettingLive(key, val) {
     }
     case 'editor.wordWrap': {
       const on = val === 'on' || val === true;
-      toggleWordWrap(on);
+      toggleWordWrap(on, false);
       break;
     }
     case 'editor.lineNumbers': {
@@ -377,17 +408,29 @@ export function applySettingLive(key, val) {
       break;
     }
     case 'workbench.colorTheme': {
-      if (val) setTheme(val, true);
+      if (val) setTheme(val);
+      break;
+    }
+    case 'workbench.sideBar.location': {
+      setSidebarLocation(val === 'right' ? 'right' : 'left');
+      break;
+    }
+    case 'workbench.sideBar.width': {
+      const width = Math.max(170, Math.min(620, Number(val) || 228));
+      $('#side').style.width = width + 'px';
+      break;
+    }
+    case 'workbench.sideBar.visible': {
+      setSidebarVisible(val !== false && val !== 'false');
       break;
     }
     case 'diffEditor.renderSideBySide': {
       const split = val === true || val === 'true';
-      setLayoutPref(split ? 'split' : 'unified');
+      setLayoutPref(split ? 'split' : 'unified', false);
       break;
     }
     case 'markdown.preview.open': {
       S.mdPreview = val === true || val === 'true';
-      try { localStorage.setItem('px0.mdPreview', S.mdPreview ? 'true' : 'false'); } catch {}
       break;
     }
     case 'editor.vimMode': {
@@ -686,6 +729,7 @@ function renderSettingsList() {
 }
 
 async function handleSettingChange(key, value) {
+  const previous = settingsData.settings?.[key];
   // Update state locally
   if (!settingsData.settings) settingsData.settings = {};
   settingsData.settings[key] = value;
@@ -696,9 +740,13 @@ async function handleSettingChange(key, value) {
 
   // Persist to server
   try {
-    const res = await apiPost('/api/settings', { [key]: value });
+    const res = await apiPostJSON('/api/settings', { [key]: value });
     if (res.raw) settingsData.raw = res.raw;
   } catch (err) {
+    settingsData.settings[key] = previous;
+    applySettingLive(key, previous);
+    renderSettingsList();
+    showToast('!', 'Could not save ' + key + ': ' + err.message, 5000);
     console.error(`Failed to save setting ${key}:`, err);
   }
 }
@@ -728,7 +776,7 @@ async function handleSaveRawSettings() {
   }
 
   try {
-    const res = await apiPost('/api/settings', { raw: rawText });
+    const res = await apiPostJSON('/api/settings', { raw: rawText });
     if (res.settings) {
       settingsData.settings = res.settings;
       S.settings = res.settings;

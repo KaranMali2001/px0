@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -106,6 +107,8 @@ func classFor(t chroma.TokenType) string {
 }
 
 var htmlEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+
+var tsMethodDecl = regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|async|readonly|abstract|override|declare|export|default|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>)?\s*\([^\n]*\)\s*(?::\s*[^={]+)?\s*\{`)
 
 // visualWidth counts runes, expanding tabs to the 4-column stops the UI uses.
 func visualWidth(s string) int {
@@ -341,7 +344,25 @@ func (d *Doc) backgroundPass() {
 
 // tokenise renders one contiguous run of source into exactly want lines of HTML.
 func (d *Doc) tokenise(src string, want int) []string {
-	return highlightLines(d.lexer, src, want)
+	lines := highlightLines(d.lexer, src, want)
+	if d.Lang == "TypeScript" {
+		highlightTypeScriptMethods(src, lines)
+	}
+	return lines
+}
+
+func highlightTypeScriptMethods(src string, lines []string) {
+	for i, raw := range strings.Split(src, "\n") {
+		if i >= len(lines) {
+			return
+		}
+		m := tsMethodDecl.FindStringSubmatch(raw)
+		if len(m) == 0 {
+			continue
+		}
+		name := m[1]
+		lines[i] = strings.Replace(lines[i], name, `<i class=nf>`+name+`</i>`, 1)
+	}
 }
 
 // highlightLines lexes src into exactly want lines of HTML, one <i class=...>

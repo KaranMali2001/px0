@@ -9,6 +9,17 @@ import (
 	"testing"
 )
 
+func TestTypeScriptMethodNamesAreHighlighted(t *testing.T) {
+	d := newDoc("  async getPaymentById(paymentId: number) {\n    return this.paymentDao.getPaymentById(paymentId)\n  }\n", "PaymentService.ts")
+	lines := d.tokenise(d.src, d.Total)
+	if !strings.Contains(lines[0], `<i class=nf>getPaymentById</i>`) {
+		t.Fatalf("method declaration was not highlighted: %q", lines[0])
+	}
+	if strings.Contains(lines[1], `<i class=nf>getPaymentById</i>`) {
+		t.Fatalf("method call must remain unstyled: %q", lines[1])
+	}
+}
+
 // Windowed lexing must agree with a full-file pass, or the view changes under
 // the user when the background pass lands.
 func fixtures(t *testing.T) []string {

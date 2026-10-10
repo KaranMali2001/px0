@@ -30,8 +30,7 @@ Requires Go 1.24+. No npm, node, CGO, or external dependencies:
 ```bash
 git clone https://github.com/px0-ai/px0.git
 cd px0
-make build
-install -d ~/.local/bin && install px0 ~/.local/bin/
+make install-cli
 ```
 
 To cross-compile binaries for all supported platforms:
@@ -39,6 +38,22 @@ To cross-compile binaries for all supported platforms:
 ```bash
 make dist
 ```
+
+### Native macOS app
+
+Build and install the optimized universal app locally:
+
+```bash
+make install-local
+```
+
+Use the existing browser workflow with `px0 .`, or open a directory in a new native px0 window with:
+
+```bash
+px0 -d .
+```
+
+`px0 -d` looks for `~/Applications/px0.app`, then `/Applications/px0.app`. Set `PX0_DESKTOP_APP` to use a different local app bundle. The local app and DMG are unsigned and may show a Gatekeeper warning.
 
 ## Features
 

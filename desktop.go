@@ -1,0 +1,198 @@
+//go:build desktop
+
+package main
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/menu"
+	"github.com/wailsapp/wails/v2/pkg/menu/keys"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/mac"
+	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+// deskHandler routes every webview request to the current workspace's *Server.
+// Swapped atomically when the user opens a different folder.
+type deskHandler struct {
+	cur atomic.Pointer[Server]
+}
+
+func (h *deskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s := h.cur.Load()
+	if s == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"no workspace open"}`))
+		return
+	}
+	s.ServeHTTP(w, trustedDesktopRequest(r))
+}
+
+// open builds a fresh engine for root and installs it as the active server.
+func (h *deskHandler) open(root string) {
+	ix := NewIndex(root)
+	lsp := newLSPManager(root, true)
+	srv := NewServer(ix, lsp)
+	if ag, err := newAgentManager(root, "", lsp); err == nil {
+		srv.SetAgent(ag)
+	}
+	h.cur.Store(srv)
+	go ix.Build()
+	rememberFolder(root)
+}
+
+var deskCtx context.Context
+
+func main() {
+	augmentPATH()
+	h := &deskHandler{}
+
+	root, openedFromArgs := startupRoot()
+	if root != "" {
+		h.open(root)
+	}
+
+	app := &options.App{
+		Title:     "px0",
+		Width:     1200,
+		Height:    800,
+		MinWidth:  600,
+		MinHeight: 400,
+		AssetServer: &assetserver.Options{
+			Handler: h,
+		},
+		Mac: &mac.Options{
+			TitleBar:             mac.TitleBarHiddenInset(),
+			Appearance:           mac.DefaultAppearance,
+			WebviewIsTransparent: true,
+			WindowIsTranslucent:  true,
+			About:                &mac.AboutInfo{Title: "px0", Message: "Read-only code navigator"},
+		},
+		Menu: buildMenu(h),
+		OnStartup: func(ctx context.Context) {
+			enableHighRefreshRate()
+			deskCtx = ctx
+			if h.cur.Load() == nil {
+				// First ever launch — no remembered folder; must pick one now.
+				openFolderDialog(h)
+				return
+			}
+			if !openedFromArgs {
+				go openFolderDialog(h)
+			}
+		},
+	}
+	if err := wails.Run(app); err != nil {
+		fatal(err)
+	}
+}
+
+func buildMenu(h *deskHandler) *menu.Menu {
+	m := menu.NewMenu()
+	m.Append(menu.AppMenu())
+	file := m.AddSubmenu("File")
+	file.AddText("Open Folder…", keys.CmdOrCtrl("o"), func(_ *menu.CallbackData) {
+		openFolderDialog(h)
+	})
+	m.Append(menu.EditMenu())
+	m.Append(menu.WindowMenu())
+	return m
+}
+
+func openFolderDialog(h *deskHandler) {
+	if deskCtx == nil {
+		return
+	}
+	dir, err := wruntime.OpenDirectoryDialog(deskCtx, wruntime.OpenDialogOptions{Title: "Open Folder"})
+	if err != nil || dir == "" {
+		return
+	}
+	h.open(dir)
+	wruntime.WindowReload(deskCtx)
+}
+
+func startupRoot() (string, bool) {
+	for _, a := range os.Args[1:] {
+		if !strings.HasPrefix(a, "-") {
+			if root, _, _, err := resolveTarget(a); err == nil {
+				return root, true
+			}
+		}
+	}
+	return lastFolder(), false
+}
+
+func folderStatePath() string {
+	return filepath.Join(filepath.Dir(settingsPath()), "last-folder")
+}
+
+func rememberFolder(root string) {
+	_ = os.MkdirAll(filepath.Dir(folderStatePath()), 0o755)
+	_ = os.WriteFile(folderStatePath(), []byte(root), 0o644)
+}
+
+func lastFolder() string {
+	b, err := os.ReadFile(folderStatePath())
+	if err != nil {
+		return ""
+	}
+	p := strings.TrimSpace(string(b))
+	if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+		return p
+	}
+	return ""
+}
+
+// augmentPATH makes LSP servers and coding agents discoverable when launched
+// from Finder (GUI apps inherit only /usr/bin:/bin:/usr/sbin:/sbin).
+// The login-shell probe is done synchronously but with a short timeout.
+func augmentPATH() {
+	extra := []string{"/opt/homebrew/bin", "/usr/local/bin"}
+	if home, err := os.UserHomeDir(); err == nil {
+		extra = append(extra,
+			filepath.Join(home, "go", "bin"),
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, ".cargo", "bin"))
+	}
+
+	// Pull the real login-shell PATH (brew, asdf, nvm…) with a hard timeout
+	// so a slow shell profile never delays startup.
+	if sh := os.Getenv("SHELL"); sh != "" {
+		type result struct{ paths []string }
+		ch := make(chan result, 1)
+		go func() {
+			cmd := exec.Command(sh, "-lc", "echo $PATH")
+			if out, err := cmd.Output(); err == nil {
+				ch <- result{strings.Split(strings.TrimSpace(string(out)), ":")}
+			} else {
+				ch <- result{}
+			}
+		}()
+		select {
+		case r := <-ch:
+			extra = append(extra, r.paths...)
+		case <-time.After(3 * time.Second):
+			// shell probe timed out; static extras still cover the common cases
+		}
+	}
+
+	seen := map[string]bool{}
+	var parts []string
+	for _, p := range append(extra, filepath.SplitList(os.Getenv("PATH"))...) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			parts = append(parts, p)
+		}
+	}
+	_ = os.Setenv("PATH", strings.Join(parts, string(os.PathListSeparator)))
+}

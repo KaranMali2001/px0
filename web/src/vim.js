@@ -1,5 +1,5 @@
 // web/src/vim.js
-import { $, esc, S, doc_, keyCaps } from './state.js';
+import { $, esc, S, doc_, keyCaps, persistPreference } from './state.js';
 import { vp, sizer, copyToClipboard, showToast } from './ui.js';
 import { render, paint, rowFor, placeCaret } from './renderer.js';
 import { moveCursor, moveCol, moveWord, caretToEdge, updateDomSelection, clearSelection, revealCaretX } from './cursor.js';
@@ -46,10 +46,8 @@ export function setVimModeEnabled(enabled, persist = true) {
   if (helpBtn) helpBtn.hidden = !vimEnabled;
 
   if (persist) {
-    try {
-      localStorage.setItem('px0.editor.vimMode', vimEnabled ? 'true' : 'false');
-    } catch {}
     if (S.settings) S.settings['editor.vimMode'] = vimEnabled;
+    persistPreference('editor.vimMode', vimEnabled).catch(() => {});
   }
 }
 
@@ -729,12 +727,7 @@ export function closeVimHelp() {
 }
 
 export function initVim() {
-  // Check initial setting from settings or localStorage fallback
   let initial = false;
-  try {
-    const val = localStorage.getItem('px0.editor.vimMode');
-    if (val === 'true') initial = true;
-  } catch {}
   if (S.settings && S.settings['editor.vimMode'] !== undefined) {
     initial = S.settings['editor.vimMode'] === true || S.settings['editor.vimMode'] === 'true';
   }

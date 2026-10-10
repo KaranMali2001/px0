@@ -22,14 +22,17 @@ const MAX_CLOSED = 20;
 export async function openFile(path, opts = {}) {
   const { line, push = true, col } = opts;
   let idx = S.tabs.findIndex(t => t.path === path);
+  console.info('[px0 open] start', { path, cached: idx >= 0, line });
   if (idx < 0) {
     let j;
     const start = line ? Math.max(0, Math.floor((line - 1) / CHUNK) * CHUNK) : 0;
     try {
       j = await api('/api/file', { path, start, count: CHUNK });
+      console.info('[px0 open] loaded', { path, total: j.total, image: !!j.image });
     } catch (e) {
+      console.error('[px0 open] failed', { path, error: e.message });
       setStatusNote(path + ': ' + e.message, 4000);
-      return;
+      return false;
     }
     const isImg = !!j.image;
     const hasDiff = !isImg && !!j.diffAvailable;
@@ -77,6 +80,8 @@ export async function openFile(path, opts = {}) {
   updateStatus();
   if ($('#panel-outline')?.classList.contains('active')) loadOutline();
   if (push) pushHistory(path, line || d.cur, col);
+  console.info('[px0 open] active', { path: d.path, tabs: S.tabs.length });
+  return true;
 }
 
 // VS Code-style diff gutter for the normal file view. Fetches once per opened

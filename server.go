@@ -47,6 +47,17 @@ type Server struct {
 	lastReq atomic.Int64 // unix nanos of the most recent request
 }
 
+type desktopRequestKey struct{}
+
+func trustedDesktopRequest(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), desktopRequestKey{}, true))
+}
+
+func isTrustedDesktopRequest(r *http.Request) bool {
+	trusted, _ := r.Context().Value(desktopRequestKey{}).(bool)
+	return trusted
+}
+
 func NewServer(ix *Index, lsp *lspManager) *Server {
 	if lsp == nil {
 		lsp = newLSPManager(ix.Root(), false)
@@ -834,4 +845,3 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, "method not allowed")
 	}
 }
-

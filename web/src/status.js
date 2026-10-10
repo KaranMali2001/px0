@@ -105,6 +105,7 @@ export function drawLspStatus() {
 
 const metricsMenuEl = $('#metrics-menu');
 let lastMetrics = null;
+let metricsTimer = 0;
 
 function renderMetricsMenu(m) {
   if (!metricsMenuEl || !m) return;
@@ -175,6 +176,15 @@ export async function refreshMetrics() {
   } catch {}
 }
 
+function scheduleMetrics() {
+  clearTimeout(metricsTimer);
+  if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
+  metricsTimer = setTimeout(async () => {
+    await refreshMetrics();
+    scheduleMetrics();
+  }, 5000);
+}
+
 export function initMetrics() {
   const contEl = $('#st-metrics');
   if (contEl) {
@@ -196,8 +206,11 @@ export function initMetrics() {
     if (e.key === 'Escape') closeMetricsMenu();
   });
 
+  addEventListener('focus', () => { refreshMetrics(); scheduleMetrics(); });
+  addEventListener('blur', scheduleMetrics);
+  document.addEventListener('visibilitychange', scheduleMetrics);
   refreshMetrics();
-  setInterval(refreshMetrics, 2500);
+  scheduleMetrics();
 }
 
 /* The status bar stays on one line. When its contents outgrow the width, it

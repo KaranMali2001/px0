@@ -270,6 +270,9 @@ func localPost(w http.ResponseWriter, r *http.Request) bool {
 		host = h
 	}
 	host = strings.Trim(host, "[]")
+	if isTrustedDesktopRequest(r) {
+		return true
+	}
 	if host != "localhost" && net.ParseIP(host) == nil {
 		fail(w, http.StatusForbidden, "open px0 by IP address or localhost to set up language servers")
 		return false

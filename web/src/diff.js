@@ -4,7 +4,7 @@
 // side-by-side split layout (default) or a single-column unified layout.
 // Unlike the code viewport this is not virtualized -- a file's own diff is
 // bounded in size, so a plain DOM render is simple and fast enough.
-import { $, S, doc_, esc, api } from './state.js';
+import { $, S, doc_, esc, api, persistPreference } from './state.js';
 import { syncPreview } from './markdown.js';
 import { setStatusNote, updateStatus } from './status.js';
 
@@ -16,12 +16,15 @@ let shown = null; // doc the diff view is currently showing, null while hidden
 // d.diffMode is 'split' | 'unified' | null (off), per tab. The layout last
 // picked (split vs unified) is remembered globally as the default for the
 // next file entering diff view.
-export function setLayoutPref(mode) {
-  try { localStorage.setItem('px0.diffLayout', mode); } catch {}
+export function setLayoutPref(mode, persist = true) {
+  const split = mode !== 'unified';
+  if (!S.settings) S.settings = {};
+  S.settings['diffEditor.renderSideBySide'] = split;
+  if (persist) persistPreference('diffEditor.renderSideBySide', split).catch(() => {});
 }
 
 export function layoutPref() {
-  try { return localStorage.getItem('px0.diffLayout') || 'split'; } catch { return 'split'; }
+  return S.settings?.['diffEditor.renderSideBySide'] === false ? 'unified' : 'split';
 }
 
 function diffMode(d = doc_()) {

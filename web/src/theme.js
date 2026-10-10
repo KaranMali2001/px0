@@ -3,9 +3,9 @@
 // prefixed with :root or html. The server joins web/themes/*.css into
 // /static/themes.css, so themes are discovered from the loaded stylesheets and
 // adding one needs no JavaScript change. See docs/internals/styling-and-themes.md.
+import { persistPreference } from './state.js';
 import { showToast } from './ui.js';
 
-const KEY = 'px0.theme';
 const DEFAULT_THEME = 'github-dark';
 const THEME_SELECTOR = /^(?::root|html)?\[data-theme=["']?([\w-]+)["']?\]$/;
 
@@ -39,27 +39,32 @@ export function listThemes() {
 
 export const currentTheme = () => document.documentElement.dataset.theme;
 
-export function setTheme(id, persist = true) {
+export function setTheme(id) {
   if (!listThemes().some(t => t.id === id)) return false;
   document.documentElement.dataset.theme = id;
-  if (persist) { try { localStorage.setItem(KEY, id); } catch {} }
   return true;
 }
 
-export function cycleTheme() {
+export async function chooseTheme(id) {
+  if (!setTheme(id)) return false;
+  try { await persistPreference('workbench.colorTheme', id); }
+  catch (err) {
+    showToast('!', 'Could not save theme: ' + err.message);
+    return false;
+  }
+  return true;
+}
+
+export async function cycleTheme() {
   const all = listThemes();
   if (!all.length) return;
   const next = all[(all.findIndex(t => t.id === currentTheme()) + 1) % all.length];
-  setTheme(next.id);
-  showToast('Theme', next.name);
+  if (await chooseTheme(next.id)) showToast('Theme', next.name);
 }
 
 export function initTheme() {
-  let saved = null;
-  try { saved = localStorage.getItem(KEY); } catch {}
-  if (saved && setTheme(saved, false)) return;
-  if (setTheme(DEFAULT_THEME, false)) return;
+  if (setTheme(DEFAULT_THEME)) return;
   // The attribute in index.html may name a theme that was since removed.
   const all = listThemes();
-  if (all.length && !all.some(t => t.id === currentTheme())) setTheme(all[0].id, false);
+  if (all.length && !all.some(t => t.id === currentTheme())) setTheme(all[0].id);
 }

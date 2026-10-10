@@ -23,14 +23,14 @@ export async function drawTree(dir, container, depth) {
     if (c.dir) {
       const dc = c.dirty ? ' dirty' : ''; // backend marks any ancestor of a change
       return '<div class="tw"><div class="tr dir' + ig + dc + '" data-dir="' + esc(c.path) + '" style="padding-left:' + pad + 'px" title="Folder: ' + esc(c.path) + note + '">' +
-        '<span class="ar"></span><span class="nm">' + esc(c.name) + '</span></div>' +
+        '<span class="ar"></span>' + icon('folder') + '<span class="nm">' + esc(c.name) + '</span></div>' +
         '<div class="kids" data-kids="' + esc(c.path) + '"></div></div>';
     }
     const g = GIT_STATUS[c.status];
     const gc = g ? ' dirty ' + g[0] : '';
     const badge = g ? '<span class="gs" title="git: ' + g[1] + '">' + esc(c.status) + '</span>' : '';
     return '<div class="tr file' + ig + gc + '" data-file="' + esc(c.path) + '" style="padding-left:' + (pad + 12) + 'px" title="Open ' + esc(c.path) + note + '">' +
-      '<span class="ic" data-t="' + fileKind(c.name) + '"></span><span class="nm">' + esc(c.name) + '</span>' + badge + '</div>';
+      icon(fileKind(c.name)) + '<span class="nm">' + esc(c.name) + '</span>' + badge + '</div>';
   }).join('');
 }
 
@@ -49,7 +49,34 @@ export const FILE_KIND = {
   png: 'img', jpg: 'img', jpeg: 'img', gif: 'img', webp: 'img', ico: 'img', avif: 'img',
 };
 
+const SPECIAL_KIND = {
+  'package.json': 'package', 'package-lock.json': 'lock', 'pnpm-lock.yaml': 'lock', 'yarn.lock': 'lock',
+  'dockerfile': 'container', 'compose.yml': 'container', 'docker-compose.yml': 'container',
+  'readme': 'doc', 'readme.md': 'doc', '.gitignore': 'config', '.gitattributes': 'config',
+  '.env': 'config', 'makefile': 'code',
+};
+
+const ICON_PATH = {
+  folder: '<path d="M1.8 4.5h4l1.5 1.7h6.9v6.7a1.2 1.2 0 0 1-1.2 1.2H3a1.2 1.2 0 0 1-1.2-1.2z"/><path d="M1.8 6.2h12.4"/>',
+  code: '<path d="m5.8 4.2-3 3.8 3 3.8M10.2 4.2l3 3.8-3 3.8"/>',
+  data: '<ellipse cx="8" cy="3.7" rx="4.6" ry="2"/><path d="M3.4 3.7v4.1c0 1.1 2.1 2 4.6 2s4.6-.9 4.6-2V3.7M3.4 7.8v4.1c0 1.1 2.1 2 4.6 2s4.6-.9 4.6-2V7.8"/>',
+  doc: '<path d="M4 1.8h5l3 3v9.4H4z"/><path d="M9 1.8v3h3M5.8 8h4.6M5.8 10.4h4.6"/>',
+  web: '<circle cx="8" cy="8" r="5.7"/><path d="M2.3 8h11.4M8 2.3c1.4 1.5 2.1 3.4 2.1 5.7S9.4 12.2 8 13.7M8 2.3C6.6 3.8 5.9 5.7 5.9 8s.7 4.2 2.1 5.7"/>',
+  img: '<rect x="2" y="2.4" width="12" height="11.2" rx="1.4"/><circle cx="5.5" cy="5.6" r="1"/><path d="m3.3 11 3.3-3.1 2.2 2 1.7-1.5 2.2 2.6"/>',
+  package: '<path d="m8 1.8 5 2.8v6.8l-5 2.8-5-2.8V4.6z"/><path d="m3 4.6 5 2.8 5-2.8M8 7.4v6.8"/>',
+  lock: '<rect x="3.1" y="7" width="9.8" height="6.2" rx="1.3"/><path d="M5.2 7V5.2a2.8 2.8 0 0 1 5.6 0V7M8 9.4v1.5"/>',
+  config: '<path d="M3 4h10M3 8h10M3 12h10"/><circle cx="5.5" cy="4" r="1.2"/><circle cx="10.5" cy="8" r="1.2"/><circle cx="7.5" cy="12" r="1.2"/>',
+  container: '<rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 6h2M9 6h2M5 9h2M9 9h2"/>',
+  other: '<path d="M4 1.8h5l3 3v9.4H4z"/><path d="M9 1.8v3h3"/>',
+};
+
+function icon(kind) {
+  return '<svg class="ic" data-t="' + kind + '" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">' + (ICON_PATH[kind] || ICON_PATH.other) + '</svg>';
+}
+
 export function fileKind(name) {
+  const special = SPECIAL_KIND[name.toLowerCase()];
+  if (special) return special;
   const i = name.lastIndexOf('.');
   return (i > 0 && FILE_KIND[name.slice(i + 1).toLowerCase()]) || 'other';
 }
@@ -104,9 +131,12 @@ export function initTree() {
     }
     const f = e.target.closest('[data-file]');
     if (f) {
+      f.classList.add('loading');
+      const opened = await openFile(f.dataset.file);
+      f.classList.remove('loading');
+      if (!opened) return;
       $$('.tr.sel', treeEl).forEach(x => x.classList.remove('sel'));
       f.classList.add('sel');
-      openFile(f.dataset.file);
     }
   });
 }

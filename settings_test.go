@@ -19,6 +19,15 @@ func TestSettingsDefaults(t *testing.T) {
 	if m["workbench.colorTheme"] != "github-dark" {
 		t.Errorf("expected workbench.colorTheme github-dark, got %v", m["workbench.colorTheme"])
 	}
+	if m["workbench.sideBar.location"] != "left" {
+		t.Errorf("expected workbench.sideBar.location left, got %v", m["workbench.sideBar.location"])
+	}
+	if m["workbench.sideBar.width"] != 228.0 {
+		t.Errorf("expected workbench.sideBar.width 228, got %v", m["workbench.sideBar.width"])
+	}
+	if m["workbench.sideBar.visible"] != true {
+		t.Errorf("expected workbench.sideBar.visible true, got %v", m["workbench.sideBar.visible"])
+	}
 	if m["editor.wordWrap"] != "on" {
 		t.Errorf("expected editor.wordWrap on, got %v", m["editor.wordWrap"])
 	}
@@ -114,7 +123,7 @@ func TestSettingsAPIEndpoints(t *testing.T) {
 
 	// 2. POST /api/settings with key/value updates
 	payload := map[string]any{
-		"editor.tabSize":       2,
+		"editor.tabSize":              2,
 		"diffEditor.renderSideBySide": false,
 	}
 	b, _ := json.Marshal(payload)
@@ -158,5 +167,33 @@ func TestSettingsAPIEndpoints(t *testing.T) {
 	}
 	if m2["workbench.colorTheme"] != "nord" {
 		t.Errorf("expected workbench.colorTheme nord from raw, got %v", m2["workbench.colorTheme"])
+	}
+}
+
+func TestSettingsAcceptsTrustedDesktopRequest(t *testing.T) {
+	isolateSettings(t)
+	srv := agentServer(t, t.TempDir(), "echo")
+	payload := bytes.NewBufferString(`{"workbench.colorTheme":"nord","workbench.sideBar.location":"right"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/settings", payload)
+	req.Host = "wails"
+	req.Header.Set("Content-Type", "application/json")
+	req = trustedDesktopRequest(req)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trusted desktop settings POST failed: %d: %s", rec.Code, rec.Body.String())
+	}
+	m := readMergedSettingsMap()
+	if m["workbench.colorTheme"] != "nord" || m["workbench.sideBar.location"] != "right" {
+		t.Fatalf("settings did not persist: %v", m)
+	}
+
+	bad := httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewBufferString(`{}`))
+	bad.Host = "wails"
+	bad.Header.Set("Origin", "wails://wails")
+	badRec := httptest.NewRecorder()
+	srv.ServeHTTP(badRec, bad)
+	if badRec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed Wails origin status = %d, want %d", badRec.Code, http.StatusForbidden)
 	}
 }

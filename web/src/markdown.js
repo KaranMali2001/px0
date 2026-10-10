@@ -1,5 +1,5 @@
 // web/src/markdown.js
-import { $, $$, S, doc_, api, isMac, MOD, LH } from './state.js';
+import { $, $$, S, doc_, api, isMac, MOD, LH, persistPreference } from './state.js';
 import { vp, rowsEl, copyToClipboard, showToast } from './ui.js';
 import { render, paint, rowFor, markNodes } from './renderer.js';
 import { openFile } from './tabs.js';
@@ -91,9 +91,9 @@ export function togglePreview() {
   updateStatus();
 }
 
-function mdSetPref(on) {
+function mdSetPref(on, persist = true) {
   S.mdPreview = on;
-  try { localStorage.setItem('px0.mdPreview', on ? 'true' : 'false'); } catch {}
+  if (persist) persistPreference('markdown.preview.open', on).catch(() => {});
 }
 
 /* ---------- sanitising ---------- */

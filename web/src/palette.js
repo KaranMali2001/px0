@@ -4,14 +4,14 @@ import { render, toggleWordWrap } from './renderer.js';
 import { openFile, centerLine, closeTab, reopenClosedTab } from './tabs.js';
 import { updateStatus } from './status.js';
 import { pushHistory } from './history.js';
-import { showPanel } from './panels.js';
+import { showPanel, toggleSidebar } from './panels.js';
 import { openFind } from './find.js';
 import { gotoDefinition, findReferences } from './lsp.js';
 import { revealFile } from './tree.js';
 import { showRightInspector, hideRightInspector } from './inspector.js';
 import { showCalls, openLspSetup } from './calls.js';
 import { showHelp } from './shortcuts.js';
-import { listThemes, currentTheme, setTheme, cycleTheme } from './theme.js';
+import { listThemes, currentTheme, setTheme, chooseTheme, cycleTheme } from './theme.js';
 import { togglePreview } from './markdown.js';
 import { openSettings } from './settings.js';
 import { showVimHelp, isVimEnabled, setVimModeEnabled } from './vim.js';
@@ -41,7 +41,7 @@ export const COMMANDS = [
   { name: 'Reveal Active File in Explorer', run: () => { const d = doc_(); if (d) { showPanel('files'); revealFile(d.path); } } },
   { name: withKeys('Toggle Word Wrap ({Alt+Z})'), run: () => toggleWordWrap() },
   { name: withKeys('Toggle Markdown Preview ({Alt+M})'), run: () => togglePreview() },
-  { name: withKeys('Toggle Sidebar ({Mod+B})'), run: () => document.body.classList.toggle('side-hidden') },
+  { name: withKeys('Toggle Sidebar ({Mod+B})'), run: toggleSidebar },
   { name: 'Select Theme…', run: () => openPalette('theme') },
   { name: 'Next Theme', run: cycleTheme },
   { name: 'Re-index Workspace', run: () => $('#btn-reindex').click() },
@@ -74,7 +74,7 @@ export function openPalette(mode, seed) {
 
 export function closePalette() {
   overlay.hidden = true;
-  if (pal && pal.restoreTheme) setTheme(pal.restoreTheme, false); // dismissed mid-preview
+  if (pal && pal.restoreTheme) setTheme(pal.restoreTheme); // dismissed mid-preview
   pal = null;
 }
 
@@ -148,7 +148,7 @@ export function drawPalette() {
     (it.right ? '<span class="pr">' + esc(it.right) + '</span>' : '') + '</div>').join('');
   const s = palList.children[pal.sel];
   if (s) s.scrollIntoView({ block: 'nearest' });
-  if (pal.mode === 'theme') setTheme(pal.items[pal.sel].id, false); // live preview
+  if (pal.mode === 'theme') setTheme(pal.items[pal.sel].id); // live preview
 }
 
 export function movePalette(delta) {
@@ -167,7 +167,7 @@ export function acceptPalette() {
     const d = doc_(); if (!d) return;
     d.cur = it.n; centerLine(it.n); render(); updateStatus(); pushHistory(d.path, it.n);
   } else if (it.kind === 'cmd') it.cmd.run();
-  else if (it.kind === 'theme') setTheme(it.id);
+  else if (it.kind === 'theme') chooseTheme(it.id);
 }
 
 export function initPalette() {
