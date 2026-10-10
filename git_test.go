@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1937,5 +1938,31 @@ func TestRemoteHostPath(t *testing.T) {
 			t.Fatalf("remoteHostPath(%q) = (%q, %q, %v), want (%q, %q, %v)",
 				c.raw, host, path, ok, c.host, c.path, c.ok)
 		}
+	}
+}
+
+func TestStartupGitQueriesAreBounded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake git is a shell script")
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	old := gitQueryTimeout
+	gitQueryTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { gitQueryTimeout = old })
+
+	root := t.TempDir()
+	start := time.Now()
+	if got := gitHeadCommit(root); got != "" {
+		t.Fatalf("gitHeadCommit = %q, want empty on timeout", got)
+	}
+	if gitAvailable(root) {
+		t.Fatal("gitAvailable = true for a hung git")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("hung git took %v, want bounded by timeout", d)
 	}
 }

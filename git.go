@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // gitDisabled turns off all git awareness (the -no-git flag). Like uiQuiet, a
@@ -27,6 +29,19 @@ var (
 	gitMu    sync.Mutex
 	gitCache = map[string]gitInfo{}
 )
+
+// gitQueryTimeout bounds the git queries run while a workspace opens. A child
+// git can block indefinitely (e.g. macOS TCC gating a privacy-protected folder
+// for a freshly signed app); we'd rather treat the folder as non-git.
+var gitQueryTimeout = 5 * time.Second
+
+func gitQuery(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitQueryTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.WaitDelay = time.Second
+	return cmd.Output()
+}
 
 // gitAvailable reports whether the git binary is on PATH and root sits inside a
 // working tree. Memoized per root: detection shells out once. Fails quiet -- no
@@ -47,10 +62,10 @@ func gitProbe(root string) gitInfo {
 	}
 	var info gitInfo
 	if _, err := exec.LookPath("git"); err == nil {
-		if out, err := exec.Command("git", "-C", root, "rev-parse", "--show-toplevel").Output(); err == nil {
+		if out, err := gitQuery("-C", root, "rev-parse", "--show-toplevel"); err == nil {
 			top := strings.TrimSpace(string(out))
 			gd := filepath.Join(top, ".git")
-			if gdOut, err := exec.Command("git", "-C", root, "rev-parse", "--git-dir").Output(); err == nil {
+			if gdOut, err := gitQuery("-C", root, "rev-parse", "--git-dir"); err == nil {
 				rawGd := strings.TrimSpace(string(gdOut))
 				if filepath.IsAbs(rawGd) {
 					gd = rawGd
@@ -1110,7 +1125,7 @@ func githubAuthorURL(root, email, name string) string {
 
 // gitHeadCommit returns the abbreviated or full HEAD commit hash.
 func gitHeadCommit(root string) string {
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--short", "HEAD").Output()
+	out, err := gitQuery("-C", root, "rev-parse", "--short", "HEAD")
 	if err != nil {
 		return ""
 	}

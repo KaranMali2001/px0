@@ -36,6 +36,12 @@ Merge of upstream `master` at `02db0c7` into `desktop-parity` (base `6be8a06` + 
 - `web/static` is now embedded. In `b8e3012` the `/static/` handler served `web/`, so `/static/favicon.ico` and `/static/fonts/*` did not resolve to `web/static/*`. Assets are now served at `static/static/...` (relative, so `-base-path` works too).
 - Three upstream git tests (`TestPRReviewerChangesInIndex`, `TestGitStagedFilesStatAndDiff`, `TestDeletedFileHandling`) failed on macOS because `t.TempDir()` lives under the `/var` → `/private/var` symlink. They now resolve the temp dir the same way other tests in `git_test.go` already do.
 
+## Desktop startup
+
+- `main()` (`desktop.go`) resolves and opens the startup workspace on a goroutine (`deskHandler.openAsync`), so `wails.Run` and the window never wait on `startupRoot`/`NewIndex`/`NewServer`/git work. The folder picker in `OnStartup` waits for that open to finish. A launch from a privacy-protected folder (e.g. `~/Desktop`) used to hang forever with no window because a child `git rev-parse` blocked before `wails.Run`.
+- `deskHandler` (`desktop_handler.go`) holds webview requests until that open finishes (capped by `deskOpenWait`, 30s), so the unchanged web UI boots against a ready server. If a request gives up, it gets the existing 503 `no workspace open` and the window reloads once the open completes.
+- Git queries on the open path (`gitProbe`, `gitHeadCommit`) go through `gitQuery`, bounded by `gitQueryTimeout` (5s). A hung git is treated like a non-git folder.
+
 ## Uncertain / follow-ups
 
 - `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.

@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,23 +19,6 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/mac"
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
-
-// deskHandler routes every webview request to the current workspace's *Server.
-// Swapped atomically when the user opens a different folder.
-type deskHandler struct {
-	cur atomic.Pointer[Server]
-}
-
-func (h *deskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s := h.cur.Load()
-	if s == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"error":"no workspace open"}`))
-		return
-	}
-	s.ServeHTTP(w, trustedDesktopRequest(r))
-}
 
 // open builds a fresh engine for root and installs it as the active server.
 func (h *deskHandler) open(root string) {
@@ -55,12 +37,20 @@ var deskCtx context.Context
 
 func main() {
 	augmentPATH()
-	h := &deskHandler{}
+	h := newDeskHandler()
 
-	root, openedFromArgs := startupRoot()
-	if root != "" {
-		h.open(root)
-	}
+	var openedFromArgs atomic.Bool
+	h.openAsync(func() string {
+		root, fromArgs := startupRoot()
+		openedFromArgs.Store(fromArgs)
+		return root
+	}, h.open)
+	go func() {
+		<-h.ready
+		if h.timedOut.Load() && deskCtx != nil {
+			wruntime.WindowReload(deskCtx)
+		}
+	}()
 
 	app := &options.App{
 		Title:     "px0",
@@ -82,14 +72,14 @@ func main() {
 		OnStartup: func(ctx context.Context) {
 			enableHighRefreshRate()
 			deskCtx = ctx
-			if h.cur.Load() == nil {
-				// First ever launch — no remembered folder; must pick one now.
-				openFolderDialog(h)
-				return
-			}
-			if !openedFromArgs {
-				go openFolderDialog(h)
-			}
+			go func() {
+				<-h.ready
+				// No folder from args or memory (first launch) must pick one;
+				// a remembered folder still offers the picker.
+				if h.cur.Load() == nil || !openedFromArgs.Load() {
+					openFolderDialog(h)
+				}
+			}()
 		},
 	}
 	if err := wails.Run(app); err != nil {
