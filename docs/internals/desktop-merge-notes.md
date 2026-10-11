@@ -88,6 +88,12 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - N4: `openFolder` (Open Folder… and Open Recent) waits for the startup open via `deskHandler.openAfterStartup`, so a slow startup install can no longer replace the folder the user picked. `install` after `shutdown` closes the new server instead of keeping it (mutex plus `closed` flag) (`TestDeskHandlerUserOpenWinsOverSlowStartup`, `TestDeskHandlerInstallAfterShutdownCloses`).
 - N5: already fixed by slice 05 (0134e05, after fd4c088). With the sidebar hidden or on the right, the traffic lights sit in the 28px `#tabs` row, which is `--wails-draggable: drag` and stays visible even with no tabs open (`html.desktop #tabs:empty { display: flex; }`). Tabs, buttons, links and inputs are `no-drag`, and custom properties inherit, so the close `x` inside a tab is `no-drag` too (`web/style.css:3-6`). `#main` has no padding strip left to cover. Not verified at runtime: when tabs fill the whole row, the only drag area left is the 80px inset beside the traffic lights.
 
+## R3 review fixes
+
+- R3-5: the empty-tab-bar drag strip is scoped to `html.desktop body:is(.side-right, .side-hidden) #tabs:empty`; with the sidebar on the left its header already holds the traffic lights and drag area, so the no-tabs state matches upstream.
+- R3-8: `openAfterStartup` serializes opens with `deskHandler.openMu`, so two quick Open Recent / Open Folder picks install and `rememberFolder` one after another (`TestDeskHandlerSerializesUserOpens`).
+- R3-4: the `px0:menu` comment in `web/src/shortcuts.js` now says WKWebView gives the page key equivalents first; the menu callback serves clicks only.
+
 ## Uncertain / follow-ups
 
 - `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.

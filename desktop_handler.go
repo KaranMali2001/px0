@@ -18,6 +18,8 @@ type deskHandler struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	openMu sync.Mutex
 }
 
 // deskOpenWait caps how long a webview request waits for the startup open.
@@ -66,9 +68,12 @@ func (h *deskHandler) shutdown() {
 }
 
 // openAfterStartup lets a still-running startup open finish first, so its
-// late install cannot replace the folder the user just chose.
+// late install cannot replace the folder the user just chose. Opens run one
+// at a time so install order matches rememberFolder's recent-list order.
 func (h *deskHandler) openAfterStartup(root string, open func(string)) {
 	<-h.ready
+	h.openMu.Lock()
+	defer h.openMu.Unlock()
 	open(root)
 }
 

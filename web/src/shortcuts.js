@@ -80,7 +80,8 @@ export function initShortcuts() {
   $('#st-ver')?.addEventListener('click', showHelp);
   $('#helpsheet').addEventListener('click', () => { $('#helpsheet').hidden = true; });
 
-  // Native menu items (desktop.go buildMenu) take these keys before the page sees them.
+  // Native menu clicks (desktop.go buildMenu) arrive here; WKWebView gives the page key
+  // equivalents first, so the matching keys are handled by the keydown handler below.
   if (document.documentElement.classList.contains('desktop')) {
     /** @type {any} */ (window).runtime?.EventsOn('px0:menu', cmd => {
       if (cmd === 'settings') openSettings('ui');

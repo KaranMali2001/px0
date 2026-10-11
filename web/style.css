@@ -2,7 +2,7 @@
    first 28px row, so whichever bar is under them shares that row and drags the window. */
 html.desktop #side header.panel-head { height: 28px; padding: 0 12px 0 80px; --wails-draggable: drag; }
 html.desktop #tabs { --wails-draggable: drag; }
-html.desktop #tabs:empty { display: flex; }
+html.desktop body:is(.side-right, .side-hidden) #tabs:empty { display: flex; }
 html.desktop :is(#side header.panel-head, #tabs) :is(button, a, input, .tab) { --wails-draggable: no-drag; }
 
 /* Colours are never written in this file: every one is read through a token.

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -269,5 +271,29 @@ func TestDeskHandlerInstallAfterShutdownCloses(t *testing.T) {
 	case <-srv.done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("late server leaked after shutdown")
+	}
+}
+
+func TestDeskHandlerSerializesUserOpens(t *testing.T) {
+	h := newDeskHandler()
+	h.openAsync(func() string { return "" }, nil)
+	var running, overlapped atomic.Bool
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.openAfterStartup("/x", func(string) {
+				if running.Swap(true) {
+					overlapped.Store(true)
+				}
+				time.Sleep(20 * time.Millisecond)
+				running.Store(false)
+			})
+		}()
+	}
+	wg.Wait()
+	if overlapped.Load() {
+		t.Fatal("folder opens ran concurrently")
 	}
 }
