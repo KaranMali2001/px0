@@ -2,12 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -347,38 +346,81 @@ func (p *idlePolicy) setForeground(fg bool) bool {
 	return fg && was
 }
 
-// worktreeStamp fingerprints the indexed worktree: a create, delete or rename
-// bumps its directory's mtime and an edit bumps the file's mtime or size.
-// Entries are summed so map order does not matter.
-func (ix *Index) worktreeStamp() uint64 {
-	ix.mu.RLock()
-	dirs := make([]string, 0, len(ix.children))
-	for d := range ix.children {
-		dirs = append(dirs, d)
-	}
-	files := ix.files
-	ix.mu.RUnlock()
+// worktreeWindow caps the lstats one cheap-check tick spends on the worktree.
+var worktreeWindow = 2000
 
-	var sum uint64
-	add := func(rel string) {
-		fi, err := os.Lstat(filepath.Join(ix.root, rel))
-		h := fnv.New64a()
-		h.Write([]byte(rel))
-		var b [16]byte
-		if err == nil {
-			binary.LittleEndian.PutUint64(b[:8], uint64(fi.ModTime().UnixNano()))
-			binary.LittleEndian.PutUint64(b[8:], uint64(fi.Size()))
+// worktreeScan fingerprints the indexed worktree one window at a time: a
+// create, delete or rename bumps its directory's mtime and an edit bumps the
+// file's mtime or size. A change outside the current window is caught when
+// the cursor reaches it or by the idle policy's backoff git run, whichever
+// comes first.
+type worktreeScan struct {
+	files  []FileEntry
+	dirs   []string
+	sums   []uint64
+	seen   int
+	cursor int
+}
+
+// tick checks the next window and reports whether it changed since the last
+// pass. A rebuilt index counts as a change.
+func (s *worktreeScan) tick(ix *Index) bool {
+	ix.mu.RLock()
+	files := ix.files
+	rebuilt := len(files) != len(s.files) || len(files) > 0 && &files[0] != &s.files[0]
+	if rebuilt {
+		s.dirs = s.dirs[:0]
+		for d := range ix.children {
+			s.dirs = append(s.dirs, d)
 		}
-		h.Write(b[:])
-		sum += h.Sum64()
 	}
-	for _, d := range dirs {
-		add(d)
+	ix.mu.RUnlock()
+	if rebuilt {
+		slices.Sort(s.dirs)
+		s.files = files
+		s.sums = make([]uint64, (len(s.dirs)+len(files)+worktreeWindow-1)/worktreeWindow)
+		s.seen, s.cursor = 0, 0
 	}
-	for _, f := range files {
-		add(f.Path)
+	if len(s.sums) == 0 {
+		return rebuilt
 	}
-	return sum
+
+	w := s.cursor
+	lo, hi := w*worktreeWindow, min((w+1)*worktreeWindow, len(s.dirs)+len(files))
+	var sum uint64
+	for i := lo; i < hi; i++ {
+		rel := ""
+		if i < len(s.dirs) {
+			rel = s.dirs[i]
+		} else {
+			rel = files[i-len(s.dirs)].Path
+		}
+		var mod, size uint64
+		if fi, err := os.Lstat(ix.root + string(filepath.Separator) + rel); err == nil {
+			mod, size = uint64(fi.ModTime().UnixNano()), uint64(fi.Size())
+		}
+		sum += entryHash(rel, mod, size)
+	}
+	changed := rebuilt || w < s.seen && s.sums[w] != sum
+	s.sums[w] = sum
+	s.seen = max(s.seen, w+1)
+	s.cursor = (w + 1) % len(s.sums)
+	return changed
+}
+
+// entryHash is FNV-1a over rel, mod and size, inlined to avoid allocating.
+func entryHash(rel string, mod, size uint64) uint64 {
+	const prime = 1099511628211
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(rel); i++ {
+		h = (h ^ uint64(rel[i])) * prime
+	}
+	for _, v := range [2]uint64{mod, size} {
+		for i := 0; i < 64; i += 8 {
+			h = (h ^ (v >> i & 0xff)) * prime
+		}
+	}
+	return h
 }
 
 // SetIdlePolicy switches the watcher to the desktop idle policy. The CLI
@@ -416,7 +458,8 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 	heartbeatTicker := time.NewTicker(15 * time.Second)
 	defer heartbeatTicker.Stop()
 
-	stamp := gw.ix.worktreeStamp()
+	var scan worktreeScan
+	scan.tick(gw.ix)
 	refresh := func(now time.Time, metaChanged bool) {
 		_, changed := gw.refresh()
 		p.refreshed(now, metaChanged || changed, time.Since(now))
@@ -435,10 +478,8 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 			var statDur time.Duration
 			listening := gw.active.Load() > 0
 			if listening {
-				s := gw.ix.worktreeStamp()
+				changed = scan.tick(gw.ix) || changed
 				statDur = time.Since(now)
-				changed = changed || s != stamp
-				stamp = s
 			}
 			if (listening || changed) && p.shouldRefresh(now, changed) {
 				refresh(time.Now(), changed)
@@ -452,7 +493,7 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 			default:
 			}
 			gw.recordGitMeta(gitdir)
-			stamp = gw.ix.worktreeStamp()
+			scan.tick(gw.ix)
 			refresh(time.Now(), false)
 			timer.Reset(p.interval(0))
 

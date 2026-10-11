@@ -164,6 +164,15 @@ In contrast, px0 embeds real-time indexing, fuzzy search, syntax highlighting, l
 
 The desktop app (`make desktop`) runs the git watcher under a desktop-only idle policy (see `docs/internals/git-integration.md`, *Desktop Idle Policy*). To measure it, launch the built `.app` against a small fixture repo with an isolated `HOME`. Wait 5 s after the window appears, then average `ps -o %cpu= -p <pid>` over 10 one-second samples, across 5 launches, and report the median. A quiet window should sit near 0%. Before the policy it measured ~2.4%, versus 0.02% for the pre-merge build. To check behaviour, edit a file in the fixture and run `git commit` while the window is in the background (the change should appear within ~6 s), then focus the window (within ~1.5 s). In the foreground, a file created from a shell should appear within ~1 s even after the window has sat idle.
 
+**Large-repo cheap check (R3-3).** `go test -run '^$' -bench WorktreeCheapTick .` measures one foreground poll over a synthetic 50,000-file tree (500 dirs × 100 files) in a temp dir. Apple M4, median of 3:
+
+| Worktree check per 1 s poll | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| Before: whole-tree fingerprint (efa3d46) | 94,227,094 | 21,808,592 | 151,504 |
+| After: 2,000-entry rotating window | 3,091,723 | 839,422 | 5,833 |
+
+Changes outside the current window are picked up by the ≤5 s backoff git refresh (`TestWorktreeScanWindowMissCaughtByBackoff`).
+
 ## 7. Memory Scavenging Verification
 
 To observe resident memory scavenging in real time, run:

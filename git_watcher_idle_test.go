@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -178,7 +179,7 @@ func TestIdlePolicyForegroundCheapTicks(t *testing.T) {
 	}
 }
 
-func TestWorktreeStamp(t *testing.T) {
+func TestWorktreeScan(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
 		t.Fatal(err)
@@ -190,27 +191,91 @@ func TestWorktreeStamp(t *testing.T) {
 	ix := NewIndex(root)
 	ix.Build()
 
-	s0 := ix.worktreeStamp()
-	if s0 != ix.worktreeStamp() {
-		t.Fatal("stamp must be stable with nothing changed")
+	var s worktreeScan
+	if !s.tick(ix) {
+		t.Fatal("first scan of a built index must report a change")
+	}
+	if s.tick(ix) {
+		t.Fatal("scan must be stable with nothing changed")
 	}
 	past := time.Now().Add(-time.Hour)
 	if err := os.Chtimes(f, past, past); err != nil {
 		t.Fatal(err)
 	}
-	s1 := ix.worktreeStamp()
-	if s1 == s0 {
-		t.Fatal("editing a file must change the stamp")
+	if !s.tick(ix) {
+		t.Fatal("editing a file must be seen")
 	}
 	if err := os.Chtimes(filepath.Join(root, "sub"), past, past); err != nil {
 		t.Fatal(err)
 	}
-	s2 := ix.worktreeStamp()
+	s.tick(ix)
 	if err := os.WriteFile(filepath.Join(root, "sub", "new.txt"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if ix.worktreeStamp() == s2 {
-		t.Fatal("creating a file must change the stamp")
+	if !s.tick(ix) {
+		t.Fatal("creating a file must be seen")
+	}
+}
+
+// With the worktree spread over several windows, an edit outside the
+// current window is invisible to the next tick but still reaches the client
+// through the backoff git run.
+func TestWorktreeScanWindowMissCaughtByBackoff(t *testing.T) {
+	if !gitInstalled() {
+		t.Skip("git not installed")
+	}
+	defer func(n int) { worktreeWindow = n }(worktreeWindow)
+	worktreeWindow = 1
+
+	root := gitRepo(t)
+	ix := NewIndex(root)
+	ix.Build()
+	var s worktreeScan
+	s.tick(ix)
+	for range len(s.sums) - 1 {
+		s.tick(ix)
+	}
+	if s.cursor != 0 || len(s.sums) < 3 {
+		t.Fatalf("cursor %d over %d windows", s.cursor, len(s.sums))
+	}
+	// keep.go sits in a later window than the one the next tick checks.
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(root, "keep.go"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	if s.tick(ix) {
+		t.Fatal("edit outside the current window must not be seen this tick")
+	}
+
+	gw := NewGitWatcher(ix)
+	gw.Start(t.Context())
+	defer gw.Stop()
+	gw.SetIdlePolicy()
+	ch, cancel := gw.Subscribe()
+	defer cancel()
+	<-ch
+	time.Sleep(2500 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(root, "keep.go"), []byte("keep edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Only the backoff git run can see the edit now, so it must be due.
+	p := gw.idle.Load()
+	p.mu.Lock()
+	p.nextFull = time.Now().Add(1500 * time.Millisecond)
+	p.mu.Unlock()
+	for len(ch) > 0 {
+		<-ch
+	}
+	deadline := time.After(4 * time.Second)
+	for {
+		select {
+		case msg := <-ch:
+			if strings.Contains(string(msg), "keep.go") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("edit outside the scan window never reached the client")
+		}
 	}
 }
 
@@ -344,5 +409,35 @@ func TestGitWatcherRetryStopsOnClose(t *testing.T) {
 	case <-gw.loopDone:
 		t.Fatal("retry must stop without starting the loop")
 	default:
+	}
+}
+
+func benchTree(b *testing.B, n int) *Index {
+	root := b.TempDir()
+	for i := 0; i < n; i++ {
+		dir := filepath.Join(root, fmt.Sprintf("d%03d", i/100))
+		if i%100 == 0 {
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d.txt", i%100)), nil, 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ix := NewIndex(root)
+	ix.Build()
+	return ix
+}
+
+// One foreground cheap-check tick over a 50,000-file worktree.
+func BenchmarkWorktreeCheapTick(b *testing.B) {
+	ix := benchTree(b, 50000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var s worktreeScan
+	s.tick(ix)
+	for b.Loop() {
+		s.tick(ix)
 	}
 }
