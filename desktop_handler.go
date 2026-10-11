@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -14,6 +15,9 @@ type deskHandler struct {
 	// timedOut records that a request gave up waiting on ready, so the
 	// window must reload once the open finishes.
 	timedOut atomic.Bool
+
+	mu     sync.Mutex
+	closed bool
 }
 
 // deskOpenWait caps how long a webview request waits for the startup open.
@@ -38,17 +42,34 @@ func (h *deskHandler) openAsync(resolve func() string, open func(string)) {
 
 // install makes srv the active workspace. The old server is closed off the
 // caller's goroutine because LSP shutdown can take a few seconds.
+// A server installed after shutdown (a slow startup open) is closed at once.
 func (h *deskHandler) install(srv *Server) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		go srv.Close()
+		return
+	}
 	if old := h.cur.Swap(srv); old != nil && old != srv {
 		go old.Close()
 	}
 }
 
-// shutdown closes the active workspace when the app quits.
 func (h *deskHandler) shutdown() {
-	if s := h.cur.Swap(nil); s != nil {
+	h.mu.Lock()
+	h.closed = true
+	s := h.cur.Swap(nil)
+	h.mu.Unlock()
+	if s != nil {
 		s.Close()
 	}
+}
+
+// openAfterStartup lets a still-running startup open finish first, so its
+// late install cannot replace the folder the user just chose.
+func (h *deskHandler) openAfterStartup(root string, open func(string)) {
+	<-h.ready
+	open(root)
 }
 
 func (h *deskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

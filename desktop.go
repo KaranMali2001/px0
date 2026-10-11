@@ -197,7 +197,7 @@ func openFolder(h *deskHandler, dir string) {
 	if err != nil {
 		return
 	}
-	h.open(root)
+	h.openAfterStartup(root, h.open)
 	wruntime.WindowReload(ctx)
 	wruntime.MenuSetApplicationMenu(ctx, buildMenu(h))
 	wruntime.MenuUpdateApplicationMenu(ctx)

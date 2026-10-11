@@ -228,3 +228,46 @@ func TestDeskHandlerSwapClosesOldAndWrapsRequests(t *testing.T) {
 		t.Fatal("shutdown left the workspace open")
 	}
 }
+
+func TestDeskHandlerUserOpenWinsOverSlowStartup(t *testing.T) {
+	h := newDeskHandler()
+	startup := agentServer(t, t.TempDir(), "echo")
+	user := agentServer(t, t.TempDir(), "echo")
+	release := make(chan struct{})
+	h.openAsync(func() string { return "/startup" }, func(string) {
+		<-release
+		h.install(startup)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		h.openAfterStartup("/user", func(string) { h.install(user) })
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	<-done
+	if h.cur.Load() != user {
+		t.Fatal("late startup open replaced the user's folder")
+	}
+	select {
+	case <-startup.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup server not closed")
+	}
+}
+
+func TestDeskHandlerInstallAfterShutdownCloses(t *testing.T) {
+	h := newDeskHandler()
+	h.shutdown()
+	srv := agentServer(t, t.TempDir(), "echo")
+	h.install(srv)
+	if h.cur.Load() != nil {
+		t.Fatal("server installed after shutdown")
+	}
+	select {
+	case <-srv.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("late server leaked after shutdown")
+	}
+}
