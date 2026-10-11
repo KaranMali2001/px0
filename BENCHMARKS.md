@@ -173,6 +173,18 @@ The desktop app (`make desktop`) runs the git watcher under a desktop-only idle 
 
 Changes outside the current window are picked up by the ≤5 s backoff git refresh (`TestWorktreeScanWindowMissCaughtByBackoff`).
 
+### Desktop app suite
+
+`./benchmark-desktop.sh` runs the same suite against the desktop app (`make desktop` first). Every run launches a private copy of `px0.app` (own bundle id and `HOME`, so your installed app's state is untouched) with `PX0_BENCH_PORT` set. The app then also serves its in-process workspace server on loopback, and `benchmark.sh` measures that process exactly as it measures the CLI. It also prints a desktop-only table: launch to window, launch to index ready, app RSS, WebKit helper RSS (WebContent, Networking, GPU), and idle CPU across all of them.
+
+```bash
+CORPUS=~/px0-bench-repos ./benchmark-desktop.sh            # both tables
+CORPUS=~/px0-bench-repos ./benchmark-desktop.sh --app      # desktop table only
+./benchmark-desktop.sh --memory ~/px0-bench-repos/linux    # any benchmark.sh mode
+```
+
+Keep the corpus outside Desktop, Documents and Downloads. Otherwise macOS asks for folder access on every launch.
+
 ## 7. Memory Scavenging Verification
 
 To observe resident memory scavenging in real time, run:

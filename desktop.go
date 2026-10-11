@@ -24,7 +24,7 @@ import (
 // open builds a fresh engine for root and installs it as the active server.
 func (h *deskHandler) open(root string) {
 	ix := NewIndex(root)
-	lsp := newLSPManager(root, true)
+	lsp := newLSPManager(root, !benchNoLSP())
 	srv := NewServer(ix, lsp)
 	srv.gitWatcher.SetIdlePolicy()
 	if ag, err := newAgentManager(root, "", lsp); err == nil {
@@ -48,6 +48,7 @@ func desktopCtx() context.Context {
 func main() {
 	augmentPATH()
 	h := newDeskHandler()
+	startBenchListener(h)
 
 	var openedFromArgs atomic.Bool
 	h.openAsync(func() string {
