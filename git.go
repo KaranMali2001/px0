@@ -98,23 +98,30 @@ func probeGit(root string, force bool) gitInfo {
 		ch := make(chan struct{})
 		gitInflight[root] = ch
 		gitMu.Unlock()
+		return finishGitProbe(root, ch)
+	}
+}
 
-		info, timedOut := runGitProbe(root)
-
+// finishGitProbe defers the inflight cleanup so a panic can't strand waiters.
+func finishGitProbe(root string, ch chan struct{}) gitInfo {
+	defer func() {
 		gitMu.Lock()
 		delete(gitInflight, root)
 		close(ch)
-		// A timeout (e.g. a pending macOS TCC prompt) is not an answer; retry later.
-		if timedOut {
-			gitTimedOut[root] = time.Now().Add(gitTimeoutTTL)
-			info = gitInfo{}
-		} else {
-			delete(gitTimedOut, root)
-			gitCache[root] = info
-		}
 		gitMu.Unlock()
-		return info
+	}()
+	info, timedOut := runGitProbe(root)
+
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	// A timeout (e.g. a pending macOS TCC prompt) is not an answer; retry later.
+	if timedOut {
+		gitTimedOut[root] = time.Now().Add(gitTimeoutTTL)
+		return gitInfo{}
 	}
+	delete(gitTimedOut, root)
+	gitCache[root] = info
+	return info
 }
 
 func runGitProbe(root string) (info gitInfo, timedOut bool) {

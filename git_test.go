@@ -1996,6 +1996,13 @@ func TestStartupGitQueriesAreBounded(t *testing.T) {
 	if d := time.Since(start); d > 50*time.Millisecond {
 		t.Fatalf("re-probe within gitTimeoutTTL took %v", d)
 	}
+	start = time.Now()
+	if gw := NewGitWatcher(NewIndex(root2)); gw.lastHeadCommit != "" {
+		t.Fatal("lastHeadCommit set for a timed-out root")
+	}
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Fatalf("NewGitWatcher on a timed-out root took %v", d)
+	}
 	gitMu.Lock()
 	delete(gitTimedOut, root)
 	delete(gitTimedOut, root2)

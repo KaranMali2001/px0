@@ -412,6 +412,35 @@ func TestGitWatcherRetryStopsOnClose(t *testing.T) {
 	}
 }
 
+func TestGitWatcherRetrySkipsRunAfterStop(t *testing.T) {
+	root := t.TempDir()
+	gitMu.Lock()
+	gitTimedOut[root] = time.Now().Add(time.Hour)
+	gitMu.Unlock()
+	t.Cleanup(func() {
+		gitMu.Lock()
+		delete(gitTimedOut, root)
+		gitMu.Unlock()
+	})
+	oldAfter, oldProbe := gitWatchAfter, gitWatchProbe
+	fired := make(chan time.Time)
+	close(fired)
+	gw := NewGitWatcher(NewIndex(root))
+	probed := make(chan struct{})
+	gitWatchAfter = func(time.Duration) <-chan time.Time { return fired }
+	gitWatchProbe = func(string) bool { gw.Stop(); close(probed); return true }
+	t.Cleanup(func() { gitWatchAfter, gitWatchProbe = oldAfter, oldProbe })
+
+	gw.Start(t.Context())
+	<-probed
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-gw.loopDone:
+		t.Fatal("loop started after Stop")
+	default:
+	}
+}
+
 func benchTree(b *testing.B, n int) *Index {
 	root := b.TempDir()
 	for i := 0; i < n; i++ {

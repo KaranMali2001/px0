@@ -96,6 +96,13 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - R3-2: `restoreWindow` clamps the saved frame with `clampWindowState` before `WindowSetSize`/`WindowSetPosition`; under 100x100 px of overlap it falls back to 1200x800 (capped to the screen) and `WindowCenter` (`TestClampWindowState`). It clamps to the *current* screen, not the union of screens: Wails 2.16 `Screen` has only sizes, no origins, and `WindowSetPosition` is relative to the current screen's `visibleFrame` (`WailsContext.m:69-80`), so a frame saved on a secondary display reopens on the current one. Runtime multi-monitor behaviour is unverified.
 - R3-1: when `GitWatcher.Start`'s probe times out (e.g. a pending macOS folder-access prompt), `retryStart` re-probes in the background after 2 s, 5 s, 10 s, then every 30 s, and starts the loop plus an immediate refresh once git answers; `Stop`/ctx end it, and a definite "not git" answer stops it (`TestGitWatcherRetriesTimedOutStart`, `TestGitWatcherRetryStopsOnClose`). `gitProbe` no longer runs git under `gitMu`: one probe per root is in flight and concurrent callers wait only for it, and a timeout is remembered for `gitTimeoutTTL` (30 s) so the other `gitAvailable` callers answer "not git" at once instead of each stalling 5 s (`TestStartupGitQueriesAreBounded`). This applies to the CLI too, which only changes behaviour when git hangs. Real TCC prompt timing is unverified.
 
+## R4 review fixes
+
+- R4-4: `retryStart` re-checks `stopCh` after a successful probe, so a `Stop` during the probe no longer starts the loop (`TestGitWatcherRetrySkipsRunAfterStop`).
+- R4-5: `probeGit`'s in-flight cleanup moved into `finishGitProbe` and runs in a `defer`, so a panic in `runGitProbe` can't leave waiters blocked. No test: there is no panic path to inject.
+- R4-6: `NewGitWatcher` reads HEAD only when `gitAvailable(root)`, so a timed-out probe no longer costs a second 5 s `rev-parse HEAD` (`TestStartupGitQueriesAreBounded`). The probe result is cached and `Start` needs it anyway, so the CLI runs no extra git.
+- R4-1: Wails 2.16 exposes only `NSScreen.frame`, not `visibleFrame`, so `clampWindowState` subtracts `screenChromeH` (100 px: menu bar plus a default bottom Dock) from the screen height; the fallback size is capped the same way (`TestClampWindowState`). A side Dock still costs its width; unverified at runtime.
+
 ## Uncertain / follow-ups
 
 - `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.

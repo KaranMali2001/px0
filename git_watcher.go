@@ -65,14 +65,18 @@ type GitWatcher struct {
 // NewGitWatcher constructs a new GitWatcher attached to the given workspace index.
 func NewGitWatcher(ix *Index) *GitWatcher {
 	gw := &GitWatcher{
-		ix:             ix,
-		root:           ix.Root(),
-		clients:        make(map[chan []byte]struct{}),
-		triggerCh:      make(chan struct{}, 1),
-		stopCh:         make(chan struct{}),
-		loopDone:       make(chan struct{}),
-		idleCh:         make(chan *idlePolicy, 1),
-		lastHeadCommit: gitHeadCommit(ix.Root()),
+		ix:        ix,
+		root:      ix.Root(),
+		clients:   make(map[chan []byte]struct{}),
+		triggerCh: make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+		loopDone:  make(chan struct{}),
+		idleCh:    make(chan *idlePolicy, 1),
+	}
+	// Skip HEAD when the probe timed out, so a pending macOS access prompt
+	// doesn't stall construction a second time.
+	if gitAvailable(gw.root) {
+		gw.lastHeadCommit = gitHeadCommit(gw.root)
 	}
 	return gw
 }
@@ -111,6 +115,11 @@ func (gw *GitWatcher) retryStart(ctx context.Context) {
 		case <-gitWatchAfter(gitWatchRetry[min(i, len(gitWatchRetry)-1)]):
 		}
 		if gitWatchProbe(gw.root) {
+			select {
+			case <-gw.stopCh:
+				return
+			default:
+			}
 			gw.run(ctx)
 			gw.Trigger()
 			return

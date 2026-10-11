@@ -69,9 +69,10 @@ func TestClampWindowState(t *testing.T) {
 		ok       bool
 	}{
 		{windowState{40, 60, 1000, 700}, windowState{40, 60, 1000, 700}, true},
-		{windowState{1000, 150, 1200, 800}, windowState{240, 100, 1200, 800}, true},
+		{windowState{1000, 150, 1200, 800}, windowState{240, 0, 1200, 800}, true},
+		{windowState{0, 0, 1440, 900}, windowState{0, 0, 1440, 800}, true},
 		{windowState{-300, -50, 1200, 800}, windowState{0, 0, 1200, 800}, true},
-		{windowState{100, 100, 3000, 2000}, windowState{0, 0, 1440, 900}, true},
+		{windowState{100, 100, 3000, 2000}, windowState{0, 0, 1440, 800}, true},
 		{windowState{3000, 100, 1200, 800}, windowState{}, false},
 		{windowState{1350, 100, 1200, 800}, windowState{}, false},
 		{windowState{-1150, 100, 1200, 800}, windowState{}, false},

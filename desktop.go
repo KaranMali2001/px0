@@ -298,14 +298,20 @@ func restoreWindow(ctx context.Context, win windowState) {
 		wruntime.WindowSetSize(ctx, fit.W, fit.H)
 		wruntime.WindowSetPosition(ctx, fit.X, fit.Y)
 	} else {
-		wruntime.WindowSetSize(ctx, min(1200, scr.Size.Width), min(800, scr.Size.Height))
+		wruntime.WindowSetSize(ctx, min(1200, scr.Size.Width), min(800, scr.Size.Height-screenChromeH))
 		wruntime.WindowCenter(ctx)
 	}
 }
 
-// clampWindowState fits s inside a sw x sh screen. It reports false when s
-// overlaps the screen by less than 100x100 px, so the caller uses the default.
+// Wails 2.16 reports only NSScreen.frame, not visibleFrame, while positions are
+// relative to the visible frame; this covers the menu bar plus a default Dock.
+const screenChromeH = 100
+
+// clampWindowState fits s inside a sw x sh screen, less screenChromeH. It
+// reports false when s overlaps it by less than 100x100 px, so the caller
+// uses the default.
 func clampWindowState(s windowState, sw, sh int) (windowState, bool) {
+	sh -= screenChromeH
 	if min(s.X+s.W, sw)-max(s.X, 0) < 100 || min(s.Y+s.H, sh)-max(s.Y, 0) < 100 {
 		return windowState{}, false
 	}
