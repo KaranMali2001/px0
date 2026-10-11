@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,10 +61,14 @@ func main() {
 		}
 	}()
 
+	win, hasWin := loadWindowState()
+	if !hasWin {
+		win = windowState{W: 1200, H: 800}
+	}
 	app := &options.App{
 		Title:     "px0",
-		Width:     1200,
-		Height:    800,
+		Width:     win.W,
+		Height:    win.H,
 		MinWidth:  600,
 		MinHeight: 400,
 		AssetServer: &assetserver.Options{
@@ -78,9 +83,22 @@ func main() {
 		},
 		Menu:       buildMenu(h),
 		OnShutdown: func(context.Context) { h.shutdown() },
+		OnBeforeClose: func(ctx context.Context) bool {
+			if wruntime.WindowIsNormal(ctx) {
+				x, y := wruntime.WindowGetPosition(ctx)
+				w, ht := wruntime.WindowGetSize(ctx)
+				saveWindowState(windowState{X: x, Y: y, W: w, H: ht})
+			}
+			return false
+		},
+		OnDomReady: func(context.Context) { addSettingsMenuItem() },
 		OnStartup: func(ctx context.Context) {
 			enableHighRefreshRate()
 			deskCtx.Store(&ctx)
+			if hasWin {
+				wruntime.WindowSetPosition(ctx, win.X, win.Y)
+			}
+			addSettingsMenuItem()
 			go func() {
 				<-h.ready
 				// No folder from args or memory (first launch) must pick one;
@@ -96,15 +114,64 @@ func main() {
 	}
 }
 
+// menuEvent is how native menu items reach the web UI, which owns the
+// matching commands (settings, tabs, sidebar).
+const menuEvent = "px0:menu"
+
+const repoURL = "https://github.com/px0-ai/px0"
+
+func emitMenu(cmd string) {
+	if ctx := desktopCtx(); ctx != nil {
+		wruntime.EventsEmit(ctx, menuEvent, cmd)
+	}
+}
+
+// buildMenu adds Settings… to the app menu natively (addSettingsMenuItem),
+// since Wails' AppMenu role has no slot for it.
 func buildMenu(h *deskHandler) *menu.Menu {
 	m := menu.NewMenu()
 	m.Append(menu.AppMenu())
+
 	file := m.AddSubmenu("File")
-	file.AddText("Open Folder…", keys.CmdOrCtrl("o"), func(_ *menu.CallbackData) {
-		openFolderDialog(h)
-	})
+	file.AddText("Open Folder…", keys.CmdOrCtrl("o"), func(*menu.CallbackData) { openFolderDialog(h) })
+	recent := file.AddSubmenu("Open Recent")
+	for _, dir := range recentFolders() {
+		dir := dir
+		recent.AddText(dir, nil, func(*menu.CallbackData) { openFolder(h, dir) })
+	}
+	file.AddSeparator()
+	file.AddText("Close Tab", keys.CmdOrCtrl("w"), func(*menu.CallbackData) { emitMenu("close-tab") })
+
 	m.Append(menu.EditMenu())
+
+	view := m.AddSubmenu("View")
+	view.AddText("Toggle Sidebar", keys.CmdOrCtrl("b"), func(*menu.CallbackData) { emitMenu("toggle-sidebar") })
+	view.AddSeparator()
+	view.AddText("Reload", keys.CmdOrCtrl("r"), func(*menu.CallbackData) {
+		if ctx := desktopCtx(); ctx != nil {
+			wruntime.WindowReload(ctx)
+		}
+	})
+	view.AddText("Toggle Full Screen", nil, func(*menu.CallbackData) {
+		ctx := desktopCtx()
+		if ctx == nil {
+			return
+		}
+		if wruntime.WindowIsFullscreen(ctx) {
+			wruntime.WindowUnfullscreen(ctx)
+		} else {
+			wruntime.WindowFullscreen(ctx)
+		}
+	})
+
 	m.Append(menu.WindowMenu())
+
+	help := m.AddSubmenu("Help")
+	help.AddText("px0 on GitHub", nil, func(*menu.CallbackData) {
+		if ctx := desktopCtx(); ctx != nil {
+			wruntime.BrowserOpenURL(ctx, repoURL)
+		}
+	})
 	return m
 }
 
@@ -117,12 +184,23 @@ func openFolderDialog(h *deskHandler) {
 	if err != nil || dir == "" {
 		return
 	}
+	openFolder(h, dir)
+}
+
+func openFolder(h *deskHandler, dir string) {
+	ctx := desktopCtx()
+	if ctx == nil {
+		return
+	}
 	root, _, _, err := resolveTarget(dir)
 	if err != nil {
 		return
 	}
 	h.open(root)
 	wruntime.WindowReload(ctx)
+	wruntime.MenuSetApplicationMenu(ctx, buildMenu(h))
+	wruntime.MenuUpdateApplicationMenu(ctx)
+	addSettingsMenuItem()
 }
 
 func startupRoot() (string, bool) {
@@ -136,25 +214,68 @@ func startupRoot() (string, bool) {
 	return lastFolder(), false
 }
 
+const maxRecentFolders = 10
+
+// folderStatePath lists recent folders, newest first. The first line alone
+// is the pre-Open Recent format, so old files still restore.
 func folderStatePath() string {
 	return filepath.Join(filepath.Dir(settingsPath()), "last-folder")
 }
 
 func rememberFolder(root string) {
+	list := []string{root}
+	for _, p := range recentFolders() {
+		if p != root && len(list) < maxRecentFolders {
+			list = append(list, p)
+		}
+	}
 	_ = os.MkdirAll(filepath.Dir(folderStatePath()), 0o755)
-	_ = os.WriteFile(folderStatePath(), []byte(root), 0o644)
+	_ = os.WriteFile(folderStatePath(), []byte(strings.Join(list, "\n")+"\n"), 0o644)
+}
+
+// recentFolders drops folders that no longer exist.
+func recentFolders() []string {
+	b, err := os.ReadFile(folderStatePath())
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(string(b), "\n") {
+		p = strings.TrimSpace(p)
+		if fi, err := os.Stat(p); p != "" && err == nil && fi.IsDir() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func lastFolder() string {
-	b, err := os.ReadFile(folderStatePath())
-	if err != nil {
-		return ""
-	}
-	p := strings.TrimSpace(string(b))
-	if fi, err := os.Stat(p); err == nil && fi.IsDir() {
-		return p
+	if r := recentFolders(); len(r) > 0 {
+		return r[0]
 	}
 	return ""
+}
+
+type windowState struct{ X, Y, W, H int }
+
+func windowStatePath() string {
+	return filepath.Join(filepath.Dir(settingsPath()), "window.json")
+}
+
+func saveWindowState(s windowState) {
+	b, _ := json.Marshal(s)
+	_ = os.MkdirAll(filepath.Dir(windowStatePath()), 0o755)
+	_ = os.WriteFile(windowStatePath(), b, 0o644)
+}
+
+// loadWindowState rejects sizes below the window minimum (600x400).
+func loadWindowState() (windowState, bool) {
+	var s windowState
+	b, err := os.ReadFile(windowStatePath())
+	if err != nil || json.Unmarshal(b, &s) != nil || s.W < 600 || s.H < 400 {
+		return windowState{}, false
+	}
+	return s, true
 }
 
 // augmentPATH makes LSP servers and coding agents discoverable when launched

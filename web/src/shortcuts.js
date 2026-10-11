@@ -80,6 +80,15 @@ export function initShortcuts() {
   $('#st-ver')?.addEventListener('click', showHelp);
   $('#helpsheet').addEventListener('click', () => { $('#helpsheet').hidden = true; });
 
+  // Native menu items (desktop.go buildMenu) take these keys before the page sees them.
+  if (document.documentElement.classList.contains('desktop')) {
+    /** @type {any} */ (window).runtime?.EventsOn('px0:menu', cmd => {
+      if (cmd === 'settings') openSettings('ui');
+      else if (cmd === 'close-tab') { if (S.active >= 0) closeTab(S.active); }
+      else if (cmd === 'toggle-sidebar') { document.body.classList.toggle('side-hidden'); layout(); render(); }
+    });
+  }
+
   // Footer quick action buttons
   $('#footer-actions')?.addEventListener('click', e => {
     const btn = e.target.closest('.footer-btn');
