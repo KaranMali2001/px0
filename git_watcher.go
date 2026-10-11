@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sync"
@@ -211,9 +213,12 @@ func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
 	}
 }
 
-// Desktop idle policy: with nothing changing, polling backs off from
-// idleBase, doubling every idleStep quiet ticks up to idleCap; any change
-// snaps it back to idleBase. In the background it polls every idleCap.
+// Desktop idle policy. In the foreground it polls every idleBase like
+// upstream, but a poll only stats .git metadata and the indexed worktree;
+// git runs when those stats change or when the full-refresh backoff expires.
+// That backoff starts at idleBase, doubles every idleStep quiet refreshes up
+// to idleCap and snaps back on any change, so edits the stats miss still show
+// within idleCap. In the background it polls metadata every idleCap.
 const (
 	idleBase = 1 * time.Second
 	idleCap  = 5 * time.Second
@@ -224,13 +229,19 @@ type idlePolicy struct {
 	mu         sync.Mutex
 	quiet      int
 	background bool
+	nextFull   time.Time
+	floor      time.Duration
 }
 
-// next records whether the last poll saw a change and returns the delay
-// until the following poll.
+// next records whether the last refresh saw a change and returns the
+// full-refresh backoff delay.
 func (p *idlePolicy) next(changed bool) time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.nextLocked(changed)
+}
+
+func (p *idlePolicy) nextLocked(changed bool) time.Duration {
 	if changed {
 		p.quiet = 0
 	} else if p.quiet < idleStep*3 {
@@ -245,6 +256,45 @@ func (p *idlePolicy) next(changed bool) time.Duration {
 	return idleCap
 }
 
+// shouldRefresh reports whether a poll at now must run git: the cheap stats
+// changed, or (foreground only) the backoff deadline has passed.
+func (p *idlePolicy) shouldRefresh(now time.Time, statChanged bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return statChanged || !p.background && !now.Before(p.nextFull)
+}
+
+// refreshed records a git refresh that started at now and took dur.
+func (p *idlePolicy) refreshed(now time.Time, changed bool, dur time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nextFull = now.Add(p.nextLocked(changed))
+	p.floor = dur * 5
+}
+
+// interval returns the delay until the next poll. The upstream adaptive
+// floor still applies, so a slow repo is not re-scanned faster than five
+// times its last git or stat scan.
+func (p *idlePolicy) interval(statDur time.Duration) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	d := idleBase
+	if p.background {
+		d = idleCap
+	}
+	floor := p.floor
+	if statDur*5 > floor {
+		floor = statDur * 5
+	}
+	if floor > d {
+		d = floor
+	}
+	if d > gitWorktreePollMax {
+		d = gitWorktreePollMax
+	}
+	return d
+}
+
 // setForeground reports whether this call brought the policy out of the
 // background.
 func (p *idlePolicy) setForeground(fg bool) bool {
@@ -256,6 +306,40 @@ func (p *idlePolicy) setForeground(fg bool) bool {
 		p.quiet = 0
 	}
 	return fg && was
+}
+
+// worktreeStamp fingerprints the indexed worktree: a create, delete or rename
+// bumps its directory's mtime and an edit bumps the file's mtime or size.
+// Entries are summed so map order does not matter.
+func (ix *Index) worktreeStamp() uint64 {
+	ix.mu.RLock()
+	dirs := make([]string, 0, len(ix.children))
+	for d := range ix.children {
+		dirs = append(dirs, d)
+	}
+	files := ix.files
+	ix.mu.RUnlock()
+
+	var sum uint64
+	add := func(rel string) {
+		fi, err := os.Lstat(filepath.Join(ix.root, rel))
+		h := fnv.New64a()
+		h.Write([]byte(rel))
+		var b [16]byte
+		if err == nil {
+			binary.LittleEndian.PutUint64(b[:8], uint64(fi.ModTime().UnixNano()))
+			binary.LittleEndian.PutUint64(b[8:], uint64(fi.Size()))
+		}
+		h.Write(b[:])
+		sum += h.Sum64()
+	}
+	for _, d := range dirs {
+		add(d)
+	}
+	for _, f := range files {
+		add(f.Path)
+	}
+	return sum
 }
 
 // SetIdlePolicy switches the watcher to the desktop idle policy. The CLI
@@ -284,8 +368,8 @@ func (gw *GitWatcher) SetForeground(fg bool) {
 }
 
 // idleLoop is loop under the desktop idle policy: one timer drives both the
-// metadata and worktree checks so a quiet repo costs a few stats every
-// idleCap instead of a git run every second.
+// metadata and worktree checks, and git only runs when they see a change or
+// the backoff says a full refresh is due.
 func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy) {
 	timer := time.NewTimer(idleBase)
 	defer timer.Stop()
@@ -293,17 +377,10 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 	heartbeatTicker := time.NewTicker(15 * time.Second)
 	defer heartbeatTicker.Stop()
 
-	// The upstream adaptive floor still applies so a slow repo is not
-	// re-scanned faster than five times its scan duration.
-	reset := func(changed bool, dur time.Duration) {
-		d := p.next(changed)
-		if floor := dur * 5; floor > d {
-			d = floor
-			if d > gitWorktreePollMax {
-				d = gitWorktreePollMax
-			}
-		}
-		timer.Reset(d)
+	stamp := gw.ix.worktreeStamp()
+	refresh := func(now time.Time, metaChanged bool) {
+		_, changed := gw.refresh()
+		p.refreshed(now, metaChanged || changed, time.Since(now))
 	}
 
 	for {
@@ -314,15 +391,20 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 			return
 
 		case <-timer.C:
+			now := time.Now()
 			changed := gw.recordGitMeta(gitdir)
-			var dur time.Duration
-			if gw.active.Load() > 0 || changed {
-				start := time.Now()
-				_, refreshed := gw.refresh()
-				dur = time.Since(start)
-				changed = changed || refreshed
+			var statDur time.Duration
+			listening := gw.active.Load() > 0
+			if listening {
+				s := gw.ix.worktreeStamp()
+				statDur = time.Since(now)
+				changed = changed || s != stamp
+				stamp = s
 			}
-			reset(changed, dur)
+			if (listening || changed) && p.shouldRefresh(now, changed) {
+				refresh(time.Now(), changed)
+			}
+			timer.Reset(p.interval(statDur))
 
 		case <-gw.triggerCh:
 			time.Sleep(50 * time.Millisecond)
@@ -331,9 +413,9 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 			default:
 			}
 			gw.recordGitMeta(gitdir)
-			start := time.Now()
-			_, changed := gw.refresh()
-			reset(changed, time.Since(start))
+			stamp = gw.ix.worktreeStamp()
+			refresh(time.Now(), false)
+			timer.Reset(p.interval(0))
 
 		case <-heartbeatTicker.C:
 			gw.broadcast([]byte(": ping\n\n"))

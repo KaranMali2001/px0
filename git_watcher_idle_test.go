@@ -118,3 +118,142 @@ func TestIdlePolicyFollowsWebSignals(t *testing.T) {
 		t.Fatal("focus refresh must return to foreground")
 	}
 }
+
+func TestIdlePolicyForegroundCheapTicks(t *testing.T) {
+	p := &idlePolicy{}
+	t0 := time.Unix(1000, 0)
+	s := time.Second
+
+	if !p.shouldRefresh(t0, false) {
+		t.Fatal("first poll must run git")
+	}
+	now := t0
+	for i := 0; i < idleStep*3; i++ {
+		p.refreshed(now, false, 0)
+		now = p.nextFull
+	}
+	if got := now.Sub(t0); got != 25*s {
+		t.Fatalf("quiet refreshes should back off 1,1,2,2,2,4,4,4,5s, total %v", got)
+	}
+
+	// Backed off: still poll every 1s, but a quiet poll skips git until the cap.
+	p.refreshed(now, false, 0)
+	if got := p.nextFull.Sub(now); got != idleCap {
+		t.Fatalf("backoff should reach the cap, got %v", got)
+	}
+	for at := now.Add(s); at.Before(now.Add(idleCap)); at = at.Add(s) {
+		if got := p.interval(0); got != idleBase {
+			t.Fatalf("foreground poll interval %v, want %v", got, idleBase)
+		}
+		if p.shouldRefresh(at, false) {
+			t.Fatalf("quiet poll at +%v must not run git", at.Sub(now))
+		}
+		if !p.shouldRefresh(at, true) {
+			t.Fatalf("stat change at +%v must run git", at.Sub(now))
+		}
+	}
+	if !p.shouldRefresh(now.Add(idleCap), false) {
+		t.Fatal("full refresh must run once the backoff expires")
+	}
+
+	p.refreshed(now, false, 400*time.Millisecond)
+	if got := p.interval(0); got != 2*s {
+		t.Fatalf("slow git run must floor the interval at 5x, got %v", got)
+	}
+	p.refreshed(now, false, 0)
+	if got := p.interval(300 * time.Millisecond); got != 1500*time.Millisecond {
+		t.Fatalf("slow stat scan must floor the interval at 5x, got %v", got)
+	}
+
+	p.setForeground(false)
+	if got := p.interval(0); got != idleCap {
+		t.Fatalf("background interval %v, want %v", got, idleCap)
+	}
+	if p.shouldRefresh(now.Add(time.Hour), false) {
+		t.Fatal("background must only run git on a metadata change")
+	}
+	if !p.shouldRefresh(now, true) {
+		t.Fatal("background metadata change must run git")
+	}
+}
+
+func TestWorktreeStamp(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(root, "sub", "a.txt")
+	if err := os.WriteFile(f, []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ix := NewIndex(root)
+	ix.Build()
+
+	s0 := ix.worktreeStamp()
+	if s0 != ix.worktreeStamp() {
+		t.Fatal("stamp must be stable with nothing changed")
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(f, past, past); err != nil {
+		t.Fatal(err)
+	}
+	s1 := ix.worktreeStamp()
+	if s1 == s0 {
+		t.Fatal("editing a file must change the stamp")
+	}
+	if err := os.Chtimes(filepath.Join(root, "sub"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	s2 := ix.worktreeStamp()
+	if err := os.WriteFile(filepath.Join(root, "sub", "new.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ix.worktreeStamp() == s2 {
+		t.Fatal("creating a file must change the stamp")
+	}
+}
+
+// Backed off to the cap with no git run due, a foreground file creation must
+// still reach the client on the next 1s stat poll.
+func TestIdlePolicyForegroundChangeLatency(t *testing.T) {
+	if !gitInstalled() {
+		t.Skip("git not installed")
+	}
+	root := gitRepo(t)
+	ix := NewIndex(root)
+	ix.Build()
+	gw := NewGitWatcher(ix)
+	gw.Start(t.Context())
+	defer gw.Stop()
+	gw.SetIdlePolicy()
+
+	ch, cancel := gw.Subscribe()
+	defer cancel()
+	<-ch
+	// Let git's racy-index rewrites of .git/index settle so only the
+	// worktree stamp can notice the new file.
+	time.Sleep(2500 * time.Millisecond)
+	p := gw.idle.Load()
+	p.mu.Lock()
+	p.quiet = idleStep * 3
+	p.nextFull = time.Now().Add(time.Hour)
+	p.mu.Unlock()
+	for len(ch) > 0 {
+		<-ch
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "fg_new.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(1500 * time.Millisecond)
+	for {
+		select {
+		case msg := <-ch:
+			if strings.Contains(string(msg), "fg_new.txt") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("foreground change did not reach the client within 1.5s")
+		}
+	}
+}
