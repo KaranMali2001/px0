@@ -78,6 +78,9 @@ func (h *deskHandler) openAfterStartup(root string, open func(string)) {
 }
 
 func (h *deskHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if serveBenchResult(w, r) {
+		return
+	}
 	select {
 	case <-h.ready:
 	case <-r.Context().Done():

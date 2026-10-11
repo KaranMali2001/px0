@@ -357,7 +357,7 @@ export async function loadSettings() {
   }
 }
 
-export function applySettingLive(key, val) {
+export function applySettingLive(key, val, fromUser = false) {
   if (!S.settings) S.settings = {};
   S.settings[key] = val;
 
@@ -414,6 +414,14 @@ export function applySettingLive(key, val) {
       break;
     }
     case 'workbench.colorTheme': {
+      // A pick in Settings is final, the default theme included; at startup a
+      // default-valued setting must not override a theme chosen in the browser.
+      if (fromUser) {
+        if (setTheme(val, false)) {
+          try { localStorage.setItem('px0.theme', val); } catch {}
+        }
+        break;
+      }
       const storedTheme = localStorage.getItem('px0.theme');
       const nextTheme = chooseThemePreference(storedTheme, val, DEFAULT_THEME);
       if (nextTheme) setTheme(nextTheme, false);
@@ -859,7 +867,7 @@ async function handleSettingChange(key, value) {
   if (!settingsData.settings) settingsData.settings = {};
   settingsData.settings[key] = value;
   delete pendingSettingsChanges[key];
-  applySettingLive(key, value);
+  applySettingLive(key, value, true);
 
   // Re-render setting card modified state
   renderSettingsList();
@@ -902,7 +910,7 @@ async function handleExplicitSave() {
   for (const [k, v] of Object.entries(pendingSettingsChanges)) {
     if (!settingsData.settings) settingsData.settings = {};
     settingsData.settings[k] = v;
-    applySettingLive(k, v);
+    applySettingLive(k, v, true);
   }
 
   setSaveStatus('saving');

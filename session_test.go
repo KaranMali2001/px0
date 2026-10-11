@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +124,27 @@ func TestPRDraftSessionPersistence(t *testing.T) {
 	}
 	if pr2.comments[0].Path != "main.go" || pr2.comments[0].Body != "Check this line" {
 		t.Errorf("unexpected restored comment: %+v", pr2.comments[0])
+	}
+}
+
+func TestSessionSidebarPersists(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	ix := NewIndex(t.TempDir())
+	s := NewServer(ix, nil, "/rev-sb/")
+	post := func(body string) {
+		req := httptest.NewRequest(http.MethodPost, "/rev-sb/api/session", strings.NewReader(body))
+		req.Host = "127.0.0.1:7777"
+		req.Header.Set("Origin", "http://127.0.0.1:7777")
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST %s: %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	post(`{"sidebar":"files"}`)
+	post(`{"sidebar":"bogus"}`)
+	post(`{"openDirs":["a"]}`)
+	if got := NewServer(ix, nil, "/rev-sb/").session.Get(); got.Sidebar != "files" || len(got.OpenDirs) != 1 {
+		t.Fatalf("restored session %+v, want sidebar files and openDirs [a]", got)
 	}
 }

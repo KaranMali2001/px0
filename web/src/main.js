@@ -106,11 +106,13 @@ initPRScope();
     }
   }
   updateStatus();
+  let savedSidebar = '';
   try {
     const session = await api('/api/session');
     if (session && Array.isArray(session.openDirs) && session.openDirs.length > 0) {
       restoreOpenDirs(session.openDirs);
     }
+    savedSidebar = session?.sidebar || '';
   } catch {}
   await refreshTree();
   initGitStream();
@@ -124,7 +126,9 @@ initPRScope();
     // The unpushed list decides this too: a clean tree with local commits
     // still belongs in Git view, which is the only place they are listed.
     await refreshUnpushed();
-    const showGit = hasGitView();
+    // A view the user picked wins; Git view is only the default when there
+    // are changes to look at.
+    const showGit = savedSidebar ? savedSidebar === 'git' : hasGitView();
     await setSidebarMode(showGit ? 'git' : 'files');
     return !!(S.meta?.git && S.meta.gitChanges > 0);
   };
@@ -140,6 +144,7 @@ initPRScope();
   };
 
   let hasGitChanges = await applyGitSidebarState();
+  let restoredTabs = false;
 
   const params = new URLSearchParams(window.location.search);
   const initialPath = params.get('path');
@@ -156,8 +161,10 @@ initPRScope();
       window.history.replaceState({}, '', cleanUrl);
     } catch {}
   } else {
-    await restoreWorkspaceTabs();
-    if (hasGitChanges) await selectChangedFileTab();
+    // Jumping to the first changed file is for a fresh workspace only; a
+    // restored session reopens on the tab that was active.
+    restoredTabs = await restoreWorkspaceTabs();
+    if (hasGitChanges && !restoredTabs) await selectChangedFileTab();
   }
 
   if (document.fonts && document.fonts.ready) {
@@ -176,7 +183,7 @@ initPRScope();
           updateStatus();
           if (!initialPath) {
             hasGitChanges = await applyGitSidebarState();
-            if (hasGitChanges) await selectChangedFileTab();
+            if (hasGitChanges && !restoredTabs) await selectChangedFileTab();
           }
         }
       } catch {

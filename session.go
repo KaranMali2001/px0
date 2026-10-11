@@ -24,11 +24,13 @@ type SessionTab struct {
 
 // WorkspaceSession stores the persistent UI state for a workspace:
 // the list of open tabs, the currently active tab index, expanded directory tree paths,
-// and any unsaved PR review comment drafts.
+// the sidebar view ("files" or "git"; empty until the user picks one), and any
+// unsaved PR review comment drafts.
 type WorkspaceSession struct {
 	Tabs     []SessionTab `json:"tabs"`
 	Active   int          `json:"active"`
 	OpenDirs []string     `json:"openDirs"`
+	Sidebar  string       `json:"sidebar,omitempty"`
 	Drafts   []prComment  `json:"drafts,omitempty"`
 }
 
@@ -140,6 +142,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			Tabs     *[]SessionTab `json:"tabs"`
 			Active   *int          `json:"active"`
 			OpenDirs *[]string     `json:"openDirs"`
+			Sidebar  *string       `json:"sidebar"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
 			fail(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -154,6 +157,9 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			}
 			if payload.OpenDirs != nil {
 				ws.OpenDirs = *payload.OpenDirs
+			}
+			if payload.Sidebar != nil && (*payload.Sidebar == "files" || *payload.Sidebar == "git") {
+				ws.Sidebar = *payload.Sidebar
 			}
 		})
 		writeJSON(w, updated)

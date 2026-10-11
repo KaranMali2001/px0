@@ -549,6 +549,23 @@ export function hideImage() {
 }
 
 export function initTabs() {
+  // The view switches float over the right end of the tab strip; reserve
+  // their width so the active tab is never scrolled underneath them.
+  // When that would leave too little room for tabs, they drop to a row of
+  // their own under the strip instead.
+  const switches = $('#view-switches'), strip = $('#tabs'), main = $('#main');
+  if (switches && strip && main && typeof ResizeObserver === 'function') {
+    const fit = () => {
+      const w = switches.offsetWidth;
+      const below = w > 0 && strip.clientWidth - w - 16 < 160;
+      main.classList.toggle('switches-below', below);
+      strip.style.setProperty('--switches-w', (w && !below ? w + 16 : 0) + 'px');
+      $('#tabs .tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    };
+    const ro = new ResizeObserver(fit);
+    ro.observe(switches);
+    ro.observe(main);
+  }
   setSourceJumpHandler(jumpToSourceLine);
   setCommitStepHandler(stepCommitFile);
   tabMenu = document.createElement('div');
