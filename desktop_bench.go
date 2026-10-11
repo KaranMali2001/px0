@@ -5,6 +5,7 @@ package main
 import (
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -22,21 +23,23 @@ func startBenchListener(h *deskHandler) {
 	if err != nil {
 		fatal(err)
 	}
-	go func() {
-		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			select {
-			case <-h.ready:
-			case <-r.Context().Done():
-				return
-			}
-			s := h.cur.Load()
-			if s == nil {
-				http.Error(w, `{"error":"no workspace open"}`, http.StatusServiceUnavailable)
-				return
-			}
-			s.ServeHTTP(w, r)
-		}))
-	}()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-h.ready:
+		case <-r.Context().Done():
+			return
+		}
+		s := h.cur.Load()
+		if s == nil {
+			http.Error(w, `{"error":"no workspace open"}`, http.StatusServiceUnavailable)
+			return
+		}
+		s.ServeHTTP(w, r)
+	})
+	go func() { _ = http.Serve(ln, mux) }()
 	// The harness stops each run with SIGTERM; tear down like a normal quit so
 	// language servers do not outlive the app.
 	stop := make(chan os.Signal, 1)

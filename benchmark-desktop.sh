@@ -18,7 +18,7 @@ BENCH_TMP="${BENCH_TMP%/}"
 BENCH_APP="$BENCH_TMP/px0-bench.app"
 BENCH_HOME="$BENCH_TMP/px0-bench-home"
 BENCH_EXE="$BENCH_APP/Contents/MacOS/px0"
-HELPER="$BENCH_TMP/px0-bench-helper"
+HELPER="$BENCH_TMP/px0-bench-helper-2"
 IDLE=${IDLE:-10}
 
 die() { echo "benchmark-desktop: $*" >&2; exit 1; }
@@ -42,7 +42,8 @@ modes:
 environment:
   APP=build/bin/px0.app  app bundle to measure (run: make desktop)
   CORPUS, PORT, RUNS     as in benchmark.sh
-  IDLE=10                seconds of idle CPU sampling per repo
+  IDLE=10                seconds of idle CPU sampling per launch
+  LAUNCHES=3             launches per repo for --app (medians reported)
   FOREGROUND=1           bring the window to the front (default: background,
                          which also selects the git watcher's background policy)
 
@@ -112,7 +113,7 @@ fi
 build_helper() {
   [ -x "$HELPER" ] && return 0
   command -v swiftc >/dev/null || die "swiftc is required (xcode-select --install)"
-  local src="$BENCH_TMP/px0-bench-helper.swift"
+  local src="$HELPER.swift"
   cat >"$src" <<'SWIFT'
 import CoreGraphics
 import Foundation
@@ -134,6 +135,17 @@ case "responsible":
     for s in args.dropFirst(3) {
         if let p = pid_t(s), p != target, responsible(p) == target { print(p) }
     }
+case "mem":
+    // Physical footprint now and at its lifetime peak, in bytes: the kernel
+    // counters behind Activity Monitor's Memory column.
+    for s in args.dropFirst(2) {
+        guard let pid = pid_t(s) else { continue }
+        var info = rusage_info_v4()
+        let ok = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
+        }
+        if ok == 0 { print(pid, info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint) }
+    }
 default:
     exit(2)
 }
@@ -150,39 +162,81 @@ prepare_app() {
   mkdir -p "$BENCH_HOME"
 }
 
-helper_pids() {
-  local candidates
-  candidates=$(ps -axo pid=,comm= | awk '/com\.apple\.WebKit\./{print $1}')
-  [ -n "$candidates" ] || return 0
-  # shellcheck disable=SC2086
-  "$HELPER" responsible "$1" $candidates
-}
-
 rss_sum_mb() {
   [ $# -gt 0 ] || { echo 0; return; }
   ps -o rss= -p "$(IFS=,; echo "$*")" 2>/dev/null | awk '{s+=$1} END{printf "%.0f", s/1024}'
 }
 
-cpu_avg() {
-  local secs=$1; shift
-  local list i
-  list=$(IFS=,; echo "$*")
-  for i in $(seq "$secs"); do
-    ps -o %cpu= -p "$list" 2>/dev/null | awk '{s+=$1} END{print s+0}'
-    sleep 1
-  done | awk '{s+=$1;n++} END{printf "%.2f", (n ? s/n : 0)}'
+# fp_mb PID... - physical footprint, what Activity Monitor shows as Memory.
+# RSS also counts the shared system frameworks mapped into every process,
+# which roughly doubles the total for a WebKit app.
+fp_mb() {
+  [ $# -gt 0 ] || { echo 0; return; }
+  "$HELPER" mem "$@" | awk '{s+=$2} END{printf "%.0f", s/1048576}'
 }
 
-APP_RESULTS=""
+peak_fp_mb() {
+  "$HELPER" mem "$1" | awk '{printf "%.0f", $3/1048576}'
+}
 
-app_one() {
-  local dir name port=$PORT pid t0 t_win="" t_ready="" i
-  dir=$(cd "$1" 2>/dev/null && pwd) || { echo "  skip $1 (missing)"; return; }
-  name=$(basename "$dir")
+# cpu_split SECS APP HELPER... - average %CPU of the app and of its helpers
+cpu_split() {
+  local secs=$1 app=$2 i list
+  shift 2
+  list=$(echo "$app $*" | tr -s ' ' ,)
+  list=${list%,}
+  for i in $(seq "$secs"); do
+    ps -o pid=,%cpu= -p "$list" 2>/dev/null
+    sleep 1
+  done | awk -v app="$app" -v n="$secs" '{ if ($1==app) a+=$2; else w+=$2 } END{printf "%.2f %.2f", a/n, w/n}'
+}
+
+biggest_file() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import os, sys
+root = os.path.abspath(sys.argv[1])
+exts = {'.go', '.c', '.h', '.py', '.js', '.ts', '.java', '.rs', '.cpp'}
+skip = {'.git', 'node_modules', 'vendor', 'dist'}
+best, size = '', 0
+for d, dirs, files in os.walk(root):
+    dirs[:] = [x for x in dirs if x not in skip]
+    for f in files:
+        if os.path.splitext(f)[1] in exts:
+            p = os.path.join(d, f)
+            try:
+                s = os.path.getsize(p)
+            except OSError:
+                continue
+            if 80000 < s < 8388608 and s > size:
+                best, size = os.path.relpath(p, root), s
+print(best)
+PY
+}
+
+urlenc() { printf %s "$1" | sed 's/ /%20/g; s/#/%23/g; s/?/%3F/g'; }
+
+# workload BASE DIR - what a review session does: fuzzy find, full-tree
+# searches, then open the largest file and scroll through it.
+workload() {
+  local base=$1 big i
+  curl -s "$base/api/find?q=srv&limit=100" >/dev/null
+  for i in 1 2 3; do curl -s "$base/api/search?q=zzqqxx_no_such_token" >/dev/null; done
+  big=$(biggest_file "$2")
+  [ -n "$big" ] || return 0
+  for i in $(seq 0 20); do
+    curl -s "$base/api/file?path=$(urlenc "$big")&start=$((i * 1000))&count=1000" >/dev/null
+  done
+}
+
+LAUNCHES=${LAUNCHES:-3}
+APP_ROWS=""
+
+app_once() {
+  local dir=$1 name=$2 run=$3 port=$PORT pid t0 t_win="" t_ready="" i
   t0=$(now_ms)
-  open_app "$port" 1 "$dir" || { echo "  skip $name (did not launch)"; return; }
-  pid=$(app_pid "$port") || { echo "  skip $name (no app process)"; return; }
-  for i in $(seq 600); do
+  open_app "$port" 1 "$dir" || return 1
+  pid=$(app_pid "$port") || return 1
+  for i in $(seq 1500); do
     if [ -z "$t_win" ] && [ "$("$HELPER" windows "$pid")" -gt 0 ]; then t_win=$(( $(now_ms) - t0 )); fi
     if [ -z "$t_ready" ] && curl -sf "http://127.0.0.1:$port/api/meta" 2>/dev/null | grep -q '"ready":true'; then
       t_ready=$(( $(now_ms) - t0 ))
@@ -193,40 +247,74 @@ app_one() {
 
   # Let the page finish loading and the post-index git status settle.
   sleep 5
-  local helpers app_mb web_mb total cpu
-  helpers=$(helper_pids "$pid")
-  app_mb=$(rss_sum_mb "$pid")
+  local helpers app_rss web_rss app_fp web_fp cpu work_fp peak idle_fp web_idle_fp
+  # shellcheck disable=SC2046
+  helpers=$("$HELPER" responsible "$pid" $(ps -axo pid=,comm= | awk '/com\.apple\.WebKit\./{print $1}'))
+  app_rss=$(rss_sum_mb "$pid")
   # shellcheck disable=SC2086
-  web_mb=$(rss_sum_mb $helpers)
-  total=$((app_mb + web_mb))
+  web_rss=$(rss_sum_mb $helpers)
+  app_fp=$(fp_mb "$pid")
   # shellcheck disable=SC2086
-  cpu=$(cpu_avg "$IDLE" "$pid" $helpers)
+  web_fp=$(fp_mb $helpers)
+  # shellcheck disable=SC2086
+  cpu=$(cpu_split "$IDLE" "$pid" $helpers)
 
-  printf '| %-12s | %8s | %8s | %7s | %7s | %8s | %3s | %7s |\n' \
-    "$name" "${t_win:-?} ms" "${t_ready:-?} ms" "$app_mb MB" "$web_mb MB" "$total MB" \
-    "$(echo "$helpers" | grep -c .)" "$cpu%"
-  APP_RESULTS="$APP_RESULTS$name,${t_win:-},${t_ready:-},$app_mb,$web_mb,$total,$cpu
+  workload "http://127.0.0.1:$port" "$dir"
+  work_fp=$(fp_mb "$pid")
+  peak=$(peak_fp_mb "$pid")
+  sleep 30
+  idle_fp=$(fp_mb "$pid")
+  # shellcheck disable=SC2086
+  web_idle_fp=$(fp_mb $helpers)
+
+  APP_ROWS="$APP_ROWS$name,$run,${t_win:-},${t_ready:-},$app_rss,$web_rss,$app_fp,$web_fp,${cpu% *},${cpu#* },$work_fp,$peak,$idle_fp,$web_idle_fp
 "
   stop_app "$pid"
   PORT=$((port + 1))
 }
 
 bench_app() {
-  local targets=("$@")
+  local targets=("$@") t dir run
   if [ ${#targets[@]} -eq 0 ]; then
     [ -d "$CORPUS" ] || die "no corpus; run: $0 --clone"
     targets=("$CORPUS"/*/)
   fi
   build_helper
+  for t in "${targets[@]}"; do
+    dir=$(cd "${t%/}" 2>/dev/null && pwd) || { echo "  skip $t (missing)"; continue; }
+    for run in $(seq "$LAUNCHES"); do
+      app_once "$dir" "$(basename "$dir")" "$run" || echo "  skip $(basename "$dir") run $run (did not launch)"
+    done
+  done
+  local header="repo,run,windowMs,readyMs,appRssMB,webkitRssMB,appFootprintMB,webkitFootprintMB,appIdleCpuPct,webkitIdleCpuPct,appAfterWorkMB,appPeakMB,appIdle30sMB,webkitIdle30sMB"
+  local csv="$BENCH_TMP/px0-bench-app.csv"
+  printf '%s\n%s' "$header" "$APP_ROWS" >"$csv"
+  python3 - "$csv" <<'PY'
+import csv, statistics, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+def med(rs, k):
+    v = [float(r[k]) for r in rs if r[k]]
+    return statistics.median(v) if v else float("nan")
+print()
+print("| Repo         | Window  | Ready   | Memory: app + WebKit = total | RSS total | Idle CPU app / WebKit | After work | Peak    | Settled: app + WebKit = total |")
+print("| ------------ | ------- | ------- | ---------------------------- | --------- | --------------------- | ---------- | ------- | ----------------------------- |")
+for name in dict.fromkeys(r["repo"] for r in rows):
+    rs = [r for r in rows if r["repo"] == name]
+    m = lambda k: med(rs, k)
+    a, w = m("appFootprintMB"), m("webkitFootprintMB")
+    rss = m("appRssMB") + m("webkitRssMB")
+    print(f"| {name:<12} | {m('windowMs'):4.0f} ms | {m('readyMs'):4.0f} ms "
+          f"| {a:4.0f} + {w:3.0f} = {a + w:4.0f} MB         | {rss:6.0f} MB "
+          f"| {m('appIdleCpuPct'):5.2f}% / {m('webkitIdleCpuPct'):4.2f}%        "
+          f"| {m('appAfterWorkMB'):6.0f} MB  | {m('appPeakMB'):4.0f} MB | {m('appIdle30sMB'):4.0f} + {m('webkitIdle30sMB'):3.0f} = {m('appIdle30sMB') + m('webkitIdle30sMB'):4.0f} MB          |")
+PY
   echo
-  echo "| Repo         | Window   | Ready    | App     | WebKit  | Total    | Hlp | Idle CPU |"
-  echo "| ------------ | -------- | -------- | ------- | ------- | -------- | --- | -------- |"
-  for t in "${targets[@]}"; do app_one "${t%/}"; done
-  echo
-  echo "Window/Ready: from launch request. App: px0 process RSS. WebKit: its WebContent,"
-  echo "Networking and GPU helpers. Idle CPU: app + helpers, ${IDLE}s average, language servers off."
+  echo "Median of $LAUNCHES launches. Window/Ready: from the launch request. Memory: physical footprint"
+  echo "(Activity Monitor's Memory column); WebKit = WebContent + Networking + GPU helpers. Idle CPU:"
+  echo "${IDLE}s average, window in the background, language servers off. After work / Peak: app"
+  echo "footprint after fuzzy find, 3 full-tree searches and scrolling the largest file; Settled: 30 s later."
   if [ -n "${APP_CSV:-}" ]; then
-    { echo "repo,windowMs,readyMs,appMB,webkitMB,totalMB,idleCpuPct"; printf %s "$APP_RESULTS"; } >"$APP_CSV"
+    cp "$csv" "$APP_CSV"
     echo "Exported desktop results to $APP_CSV"
   fi
 }
