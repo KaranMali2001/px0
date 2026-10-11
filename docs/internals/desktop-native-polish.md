@@ -28,6 +28,24 @@ Not affected by `desktop.nativeStyling`: these are native app behaviour, not web
 | Window size and position saved on close (only when the window is normal, not full screen/maximised) to `window.json` next to `settings.json`, restored at launch; min size stays 600×400 | Native apps reopen where you left them | apple-design: spatial consistency | Delete `window.json` |
 | Native chrome follows system appearance (`mac.DefaultAppearance`) | Menus, dialogs and traffic lights match the OS light/dark setting | apple-design | Not configurable |
 
+## Native styling refinements (`html.desktop.native`, end of `web/style.css`)
+
+All off when `desktop.nativeStyling` is `false`. No colour tokens change; new colours are `color-mix` of existing tokens, so every light and dark theme keeps working.
+
+| What | Why | Guideline | How to disable |
+| --- | --- | --- | --- |
+| Radius scale `--r: 6px`, `--r-lg: 8px` (stage tick pinned to 3px so it stays a square) | Upstream's near-flat 2/4px reads as web; macOS controls and popovers use 6/8 | make-interfaces-feel-better / better-ui: consistent radii | `desktop.nativeStyling: false` |
+| Thin overlay-style scrollbars: 10px, transparent track, rounded thumb `color-mix(--fg 22%)`, 40% on hover | Upstream thumb has a `--bg` border box that looks like a solid gutter; macOS overlay scrollers float over content | apple-design: materials, restraint | same |
+| Focus ring `2px` accent (75% mix), `outline-offset: 1px`, at zero specificity (`:where`) | Gives a crisp ring to any control without one; components with their own inset rings or `outline: none` focus styles keep them. Inputs/textareas/contenteditable excluded (they show focus by border) | better-accessibility: visible focus; apple-design: accent focus ring | same |
+| Invisible `::after` hit areas: panel action buttons 20→24px, tab close 15→25px | Fitts: small icon targets in chrome; the drawn control does not move | better-ui: hit areas ≥ 24px | same |
+| `cursor: default` on buttons, tabs, tree/list rows, menu items, panel headers | macOS uses the arrow for controls; the pointing hand is reserved for links. Editor keeps `text`, resizers keep their resize cursors | apple-design: platform conventions | same |
+| Overlay fade (120ms), palette/settings pop (`scale(.98)`, 140ms, ease-out), context menu fade (100ms); only under `prefers-reduced-motion: no-preference` | Quick enough not to delay keyboard work; entry only, no exit animation | emil-design-eng: ≤150ms, ease-out for UI, reduced-motion fallback | same, or reduce motion in System Settings |
+
+Decisions:
+
+- **Font smoothing**: upstream `body` already sets `-webkit-font-smoothing: antialiased`, so nothing is added.
+- **Translucency**: `WindowIsTranslucent` stays on, but no sidebar vibrancy is added. The page paints an opaque `--bg`/`--bg2`, so the vibrancy material is only visible for the moment before first paint, where it acts as an appearance-matched backdrop instead of a white flash. Making `#side` see-through would tint every theme's sidebar with the desktop wallpaper (muddy colours, broken contrast guarantees of the themes), so it is deliberately not done.
+
 ## Known limits
 
 - Open Recent shows full paths; a moved display can leave a restored window partly off-screen (macOS does not clamp `WindowSetPosition`).

@@ -3000,3 +3000,38 @@ body.hide-git-gutter .g-git, body.hide-git-gutter [class*="git-"] { display: non
 .thr-scope button.active { color: var(--accent-fg); border-color: var(--accent); background: var(--bg2); }
 .thr-scope button:disabled { opacity: .4; cursor: default; }
 .thr-compose { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line); }
+
+/* Desktop refinements, off with desktop.nativeStyling (html.native).
+   See docs/internals/desktop-native-polish.md. */
+html.desktop.native { --r: 6px; --r-lg: 8px; }
+html.desktop.native .tr .stage-tick { border-radius: 3px; }
+
+html.desktop.native ::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+html.desktop.native ::-webkit-scrollbar-track { background: transparent; }
+html.desktop.native ::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 22%, transparent);
+  border: 3px solid transparent; background-clip: padding-box; border-radius: 5px;
+}
+html.desktop.native ::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--fg) 40%, transparent); }
+
+/* Zero specificity so components with their own (often inset) rings keep them. */
+:where(html.desktop.native :focus-visible:not(input, textarea, [contenteditable])) {
+  outline: 2px solid color-mix(in srgb, var(--accent) 75%, transparent); outline-offset: 1px;
+}
+
+/* 24px hit areas without moving the drawn controls. */
+html.desktop.native :is(.panel-actions .mini, .tab .x) { position: relative; }
+html.desktop.native .panel-actions .mini::after { content: ""; position: absolute; inset: -2px; }
+html.desktop.native .tab .x::after { content: ""; position: absolute; inset: -5px; }
+
+/* macOS chrome uses the arrow cursor on controls; the pointing hand is for links. */
+html.desktop.native :is(button, .tab, .tr, .tr .stage-tick, .sym, .rfile, .pi, .up-row, .up-file, .up-more,
+  .git-commit-row, .inspector-tab, .sel-menu-item, .panel-head) { cursor: default; }
+
+@media (prefers-reduced-motion: no-preference) {
+  html.desktop.native :is(#overlay, .modal-overlay) { animation: desk-fade .12s ease-out; }
+  html.desktop.native :is(#palette, .settings-dialog) { animation: desk-pop .14s cubic-bezier(.2, .9, .3, 1); }
+  html.desktop.native :is(#sel-menu, #tab-menu, #tree-menu) { animation: desk-fade .1s ease-out; }
+}
+@keyframes desk-fade { from { opacity: 0; } }
+@keyframes desk-pop { from { opacity: 0; transform: scale(.98); } }
