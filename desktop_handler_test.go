@@ -105,7 +105,7 @@ func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self';") {
 		t.Fatalf("desktop index CSP = %q", csp)
 	}
-	if strings.Contains(desk, "https://px0.ai/favicon") || strings.Contains(desk, "https://px0.ai/logo/") || strings.Contains(desk, "fonts.googleapis.com/css2") {
+	if strings.Contains(desk, "https://px0.ai/favicon") || strings.Contains(desk, "https://px0.ai/logo/") || strings.Contains(desk, "fonts.googleapis.com") || strings.Contains(desk, "fonts.gstatic.com") {
 		t.Fatal("desktop index still loads remote fonts/favicons/logos")
 	}
 	if css := get(httptest.NewRequest(http.MethodGet, "/static/static/fonts/fonts.css", nil)); !strings.Contains(css, "JetBrainsMono-Regular.woff2") {

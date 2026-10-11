@@ -1965,4 +1965,10 @@ func TestStartupGitQueriesAreBounded(t *testing.T) {
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("hung git took %v, want bounded by timeout", d)
 	}
+	gitMu.Lock()
+	_, cached := gitCache[root]
+	gitMu.Unlock()
+	if cached {
+		t.Fatal("timed-out probe was cached as not-a-repo")
+	}
 }

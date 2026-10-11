@@ -171,6 +171,7 @@ type lspManager struct {
 	available []string
 	restarts  map[string]int // crashes recovered from, per server name
 	stopped   map[string]bool
+	closed    bool // set by Close; a closed server's in-flight requests must not re-spawn
 
 	discovered bool // the first discover() has finished
 
@@ -504,7 +505,7 @@ func (m *lspManager) client(ctx context.Context, rel string) (*lspClient, error)
 		return nil, errNoServer
 	}
 	m.mu.RLock()
-	stopped := m.stopped != nil && m.stopped[def.Name]
+	stopped := m.closed || m.stopped != nil && m.stopped[def.Name]
 	m.mu.RUnlock()
 	if stopped {
 		return nil, errStopped
@@ -599,13 +600,17 @@ func (m *lspManager) spawn(def *lspServerDef, done chan struct{}) {
 	err := c.start(ctx)
 
 	m.mu.Lock()
+	closed := m.closed
 	if err != nil {
 		m.failed[def.Name] = err.Error()
-	} else {
+	} else if !closed {
 		m.clients[def.Name] = c
 	}
 	delete(m.starting, def.Name)
 	m.mu.Unlock()
+	if err == nil && closed {
+		c.shutdown()
+	}
 	close(done)
 }
 
@@ -681,6 +686,7 @@ func (m *lspManager) RefreshOpenDocs() {
 
 func (m *lspManager) Close() {
 	m.mu.Lock()
+	m.closed = true
 	clients := make([]*lspClient, 0, len(m.clients))
 	for _, c := range m.clients {
 		clients = append(clients, c)
@@ -747,6 +753,10 @@ func (m *lspManager) StartServer(name string) error {
 		return fmt.Errorf("lsp disabled")
 	}
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return errStopped
+	}
 	if m.stopped != nil {
 		delete(m.stopped, name)
 	}

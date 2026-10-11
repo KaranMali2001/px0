@@ -687,6 +687,8 @@ func desktopIndex(html string, native bool) string {
 		`<html lang="en"`, `<html class="`+class+`" lang="en"`,
 		`"https://px0.ai/favicon`, `"static/static/favicon`,
 		`"https://px0.ai/logo/`, `"static/static/logo/`,
+		`<link rel="preconnect" href="https://fonts.googleapis.com">`, ``,
+		`<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>`, ``,
 		`"https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap"`, `"static/static/fonts/fonts.css"`,
 	).Replace(html)
 }

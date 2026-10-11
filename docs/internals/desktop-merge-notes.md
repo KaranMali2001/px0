@@ -74,7 +74,13 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - Opening another folder swaps the active server (`deskHandler.install`) and closes the old one on a goroutine, so its git watcher, scavenger, LSP children, agent runs and thread turns stop. `OnShutdown` closes the active server (`deskHandler.shutdown`).
 - `File > Open Folder…` resolves the picked folder with `resolveTarget` (abs + `EvalSymlinks`) before opening and remembering it, matching CLI/startup roots. `deskCtx` is an `atomic.Pointer` because menu callbacks and the startup goroutines read it while `OnStartup` writes it.
 - The macOS About panel shows `px0 <version>` (from `version.go`/`VERSION`) and "Code navigator with agent editing".
-- Git queries on the open path (`gitProbe`, `gitHeadCommit`) go through `gitQuery`, bounded by `gitQueryTimeout` (5s). A hung git is treated like a non-git folder.
+- Git queries on the open path (`gitProbe`, `gitHeadCommit`) go through `gitQuery`, bounded by `gitQueryTimeout` (5s). A hung git is treated like a non-git folder for that call, but a timed-out probe is not cached in `gitCache`, so the next probe retries (e.g. after the user answers a TCC prompt).
+
+## R2 review fixes
+
+- N1: `gitQuery` returns `ctx.Err()` on timeout; `gitProbe` skips `gitCache` when either query hit `context.DeadlineExceeded` (`TestStartupGitQueriesAreBounded`).
+- N2: `lspManager.Close` latches `closed`; `client`/`StartServer` return `errStopped` and a spawn finishing after Close shuts its child down (`TestManagerCloseLatches`).
+- N7: `desktopIndex` also drops the two Google Fonts `preconnect` links, so the desktop page opens no connection to Google.
 
 ## Uncertain / follow-ups
 

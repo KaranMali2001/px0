@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -107,6 +108,23 @@ func TestManagerDisabled(t *testing.T) {
 	}
 	if state, _ := m.State("x.go"); state != lspOff {
 		t.Errorf("disabled manager state = %v, want off", state)
+	}
+}
+
+func TestManagerCloseLatches(t *testing.T) {
+	t.Parallel()
+	m := newLSPManager(t.TempDir(), false)
+	m.enabled = true
+	m.byExt[".go"] = &lspServerDef{Name: "fake", Cmd: []string{"true"}}
+	m.Close()
+	if _, err := m.client(context.Background(), "x.go"); err != errStopped {
+		t.Errorf("client after Close = %v, want errStopped", err)
+	}
+	if err := m.StartServer("fake"); err != errStopped {
+		t.Errorf("StartServer after Close = %v, want errStopped", err)
+	}
+	if m.AnyRunning() {
+		t.Error("closed manager reports a running server")
 	}
 }
 

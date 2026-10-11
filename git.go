@@ -40,7 +40,11 @@ func gitQuery(args ...string) ([]byte, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.WaitDelay = time.Second
-	return cmd.Output()
+	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return out, ctx.Err()
+	}
+	return out, err
 }
 
 // gitAvailable reports whether the git binary is on PATH and root sits inside a
@@ -61,11 +65,16 @@ func gitProbe(root string) gitInfo {
 		return info
 	}
 	var info gitInfo
+	timedOut := false
 	if _, err := exec.LookPath("git"); err == nil {
-		if out, err := gitQuery("-C", root, "rev-parse", "--show-toplevel"); err == nil {
+		out, err := gitQuery("-C", root, "rev-parse", "--show-toplevel")
+		timedOut = errors.Is(err, context.DeadlineExceeded)
+		if err == nil {
 			top := strings.TrimSpace(string(out))
 			gd := filepath.Join(top, ".git")
-			if gdOut, err := gitQuery("-C", root, "rev-parse", "--git-dir"); err == nil {
+			gdOut, err := gitQuery("-C", root, "rev-parse", "--git-dir")
+			timedOut = errors.Is(err, context.DeadlineExceeded)
+			if err == nil {
 				rawGd := strings.TrimSpace(string(gdOut))
 				if filepath.IsAbs(rawGd) {
 					gd = rawGd
@@ -75,6 +84,10 @@ func gitProbe(root string) gitInfo {
 			}
 			info = gitInfo{ok: true, toplevel: top, gitdir: gd}
 		}
+	}
+	// A timeout (e.g. a pending macOS TCC prompt) is not an answer; retry next time.
+	if timedOut {
+		return gitInfo{}
 	}
 	gitCache[root] = info
 	return info
