@@ -143,6 +143,16 @@ To keep git statuses, sidebar badges, and editor gutter diff indicators in sync 
    - **Page Visibility API**: When the browser tab is hidden (`document.visibilityState === 'hidden'`), the frontend closes the SSE connection. The backend detects zero active subscribers and pauses background worktree polling completely, saving CPU and laptop battery.
    - **Instant Focus Wakeup**: When the user switches back to px0 (`focus` or `visibilitychange` to visible), the client reconnects and immediately issues a POST to `/api/git/refresh` to catch any changes made while the user was in another application.
 
+### Desktop Idle Policy
+
+The CLI server keeps the loop above unchanged (1 s metadata ticker, 1–10 s adaptive worktree ticker; `gitMetaPoll`/`gitWorktreePollMin`/`gitWorktreePollMax` in `git_watcher.go`, pinned by `TestDefaultServerKeepsUpstreamIntervals`). With a webview always connected, that loop cost the desktop app ~2.4% idle CPU, so `desktop.go` calls `GitWatcher.SetIdlePolicy()`, which hands the running watcher an `idlePolicy` and switches it to `idleLoop`:
+
+- **Backoff**: one timer drives both the metadata and worktree checks. Starting at 1 s, it doubles every 3 consecutive quiet polls (1 → 2 → 4 → 5 s cap) and snaps back to 1 s on any detected change. The upstream floor (5× the last scan time, max 10 s) still applies to slow repos.
+- **Background**: while the window is hidden or minimised it polls every 5 s (metadata only, since no client is subscribed).
+- **Foreground**: coming back triggers an immediate refresh and resumes 1 s polling.
+
+No new frontend code: `GitWatcher.SetForeground` is driven by the signals `web/src/gitstream.js` already sends. Hiding the page closes the SSE stream (last `Subscribe` cancel → background), showing it reconnects (first `Subscribe` → foreground), and window `focus` POSTs `/api/git/refresh` (`handleGitRefresh` → foreground, backoff reset). A visible but unfocused window is not reported and just backs off to the 5 s cap. Changes therefore appear within ~1 s of regaining focus and within ~6 s in the background. On the CLI there is no policy and `SetForeground` does nothing.
+
 4. **In-Memory Concurrency & Tree Updates (`UpdateGitStatus`)**
    - Refreshing git status does not re-walk the directory tree on disk.
    - `Index.UpdateGitStatus()` executes `gitStatus(ix.root)` concurrently, compares the new status map against `ix.gitStatusMap`, and if changed, updates `Node.Status` and `Node.Dirty` in-place on existing `ix.children` nodes.

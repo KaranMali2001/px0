@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,11 +62,11 @@ func TestIdlePolicyFocusRefreshesImmediately(t *testing.T) {
 	gw.Start(t.Context())
 	defer gw.Stop()
 	gw.SetIdlePolicy()
-	gw.SetForeground(false)
 
 	ch, cancel := gw.Subscribe()
 	defer cancel()
 	<-ch
+	gw.SetForeground(false)
 
 	// Past the first 1s tick, the background policy has the next poll ~5s out,
 	// so only the focus trigger can deliver the change within the deadline.
@@ -85,5 +86,35 @@ func TestIdlePolicyFocusRefreshesImmediately(t *testing.T) {
 		case <-deadline:
 			t.Fatal("focus did not refresh git status within 1.5s")
 		}
+	}
+}
+
+// The desktop web UI drops its SSE stream when hidden and POSTs
+// /api/git/refresh on focus; those must drive the idle policy.
+func TestIdlePolicyFollowsWebSignals(t *testing.T) {
+	s := NewServer(NewIndex(t.TempDir()), nil)
+	defer s.Close()
+	gw := s.gitWatcher
+	gw.SetIdlePolicy()
+	p := gw.idle.Load()
+	bg := func() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.background }
+
+	_, cancel := gw.Subscribe()
+	if bg() {
+		t.Fatal("connected client must be foreground")
+	}
+	cancel()
+	if !bg() {
+		t.Fatal("last client disconnecting (page hidden) must go background")
+	}
+	_, cancel = gw.Subscribe()
+	if bg() {
+		t.Fatal("reconnecting (page visible) must return to foreground")
+	}
+	cancel()
+
+	s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/git/refresh", nil))
+	if bg() {
+		t.Fatal("focus refresh must return to foreground")
 	}
 }

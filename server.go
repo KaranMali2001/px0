@@ -1543,6 +1543,7 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGitRefresh(w http.ResponseWriter, r *http.Request) {
 	if s.gitWatcher != nil {
 		payload := s.gitWatcher.Refresh()
+		s.gitWatcher.SetForeground(true)
 		writeJSON(w, payload)
 		return
 	}

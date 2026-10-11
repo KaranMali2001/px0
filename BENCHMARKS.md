@@ -160,7 +160,11 @@ PID     Role / Component                 RSS (MB)   CPU %
 
 In contrast, px0 embeds real-time indexing, fuzzy search, syntax highlighting, language-routing, and server endpoints inside a single, zero-dependency native process.
 
-## 6. Memory Scavenging Verification
+## 6. Desktop Idle CPU
+
+The desktop app (`make desktop`) runs the git watcher under a desktop-only idle policy (see `docs/internals/git-integration.md`, *Desktop Idle Policy*). To measure it, launch the built `.app` against a small fixture repo with an isolated `HOME`. Wait 5 s after the window appears, then average `ps -o %cpu= -p <pid>` over 10 one-second samples, across 5 launches, and report the median. A quiet window should sit near 0%. Before the policy it measured ~2.4%, versus 0.02% for the pre-merge build. To check behaviour, edit a file in the fixture and run `git commit` while the window is in the background (the change should appear within ~6 s), then focus the window (within ~1.5 s).
+
+## 7. Memory Scavenging Verification
 
 To observe resident memory scavenging in real time, run:
 

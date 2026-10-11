@@ -240,13 +240,17 @@ func (p *idlePolicy) next(changed bool) time.Duration {
 	return idleCap
 }
 
-func (p *idlePolicy) setForeground(fg bool) {
+// setForeground reports whether this call brought the policy out of the
+// background.
+func (p *idlePolicy) setForeground(fg bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	was := p.background
 	p.background = !fg
 	if fg {
 		p.quiet = 0
 	}
+	return fg && was
 }
 
 // SetIdlePolicy switches the watcher to the desktop idle policy. The CLI
@@ -260,14 +264,16 @@ func (gw *GitWatcher) SetIdlePolicy() {
 }
 
 // SetForeground reports whether the app window is visible and focused.
-// Coming to the foreground refreshes immediately and resumes fast polling.
+// Foreground resumes fast polling; coming out of the background also
+// refreshes immediately. The desktop web UI already signals both: it drops
+// its SSE stream when hidden (Subscribe/cancel) and POSTs /api/git/refresh
+// on focus (handleGitRefresh).
 func (gw *GitWatcher) SetForeground(fg bool) {
 	p := gw.idle.Load()
 	if p == nil {
 		return
 	}
-	p.setForeground(fg)
-	if fg {
+	if p.setForeground(fg) {
 		gw.Trigger()
 	}
 }
@@ -422,8 +428,11 @@ func (gw *GitWatcher) Subscribe() (<-chan []byte, func()) {
 
 	gw.mu.Lock()
 	gw.clients[ch] = struct{}{}
-	gw.active.Add(1)
+	first := gw.active.Add(1) == 1
 	gw.mu.Unlock()
+	if first {
+		gw.SetForeground(true)
+	}
 
 	// Immediately send current state to newly connected client
 	inGit := gitAvailable(gw.root)
@@ -453,7 +462,9 @@ func (gw *GitWatcher) Subscribe() (<-chan []byte, func()) {
 		gw.mu.Lock()
 		if _, ok := gw.clients[ch]; ok {
 			delete(gw.clients, ch)
-			gw.active.Add(-1)
+			if gw.active.Add(-1) == 0 {
+				gw.SetForeground(false)
+			}
 			close(ch)
 		}
 		gw.mu.Unlock()
