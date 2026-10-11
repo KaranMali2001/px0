@@ -2,7 +2,7 @@
 
 A thread is a long-running conversation with your coding harness about your code. Where an inline edit ([Agent Editing](agent-editing.md)) is a single instruction that runs once and is forgotten, a thread keeps its transcript and continues the same conversation with every message. Use it to ask what code does, follow up on the answer, ask whether a change affects other places, and make edits across as many files as the conversation needs.
 
-Threads live in the right sidebar, on the **Threads** tab, next to References, Symbols, Calls and Search.
+Threads live in the right sidebar, on the **Threads** tab, next to References, Symbols, Calls and Search. Closing this panel keeps it closed when px0 restarts. Its selected tab and width are remembered per workspace; closing the panel does not delete conversations.
 
 ## Starting a Thread
 

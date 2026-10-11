@@ -9,7 +9,7 @@ import { drawTree, treeEl, initTree, revealFile, refreshTree, restoreOpenDirs, s
 import { initSearch } from './search.js';
 import { initOutline } from './outline.js';
 import { initPanels } from './panels.js';
-import { initInspector, showRightInspector } from './inspector.js';
+import { initInspector, restoreInspectorState } from './inspector.js';
 import { initCalls } from './calls.js';
 import { initFind } from './find.js';
 import { initPalette } from './palette.js';
@@ -93,7 +93,6 @@ initPRScope();
   updateSidebarToggleState();
   applyAgentMeta();
   initPR();
-  showRightInspector(); // the right sidebar starts open, on Threads when there is a harness
   document.title = S.meta.name + ' - px0';
   $('#root-name').textContent = S.meta.name;
   $('#root-name').title = S.meta.root;
@@ -108,13 +107,16 @@ initPRScope();
   }
   updateStatus();
   let savedSidebar = '';
+  let savedInspector = null;
   try {
     const session = await api('/api/session');
     if (session && Array.isArray(session.openDirs) && session.openDirs.length > 0) {
       restoreOpenDirs(session.openDirs);
     }
     savedSidebar = session?.sidebar || '';
+    savedInspector = session?.inspector || null;
   } catch {}
+  restoreInspectorState(savedInspector);
   await loadIcons();
   await refreshTree();
   initGitStream();

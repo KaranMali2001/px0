@@ -14,6 +14,8 @@ px0 is engineered as an ultra-fast, zero-overhead code exploration console. Its 
 
 The shared web frontend resolves bundled file and folder icons in `web/src/icons.js`; dedicated folder-state classes keep sidebar geometry independent of the editor’s code-cell styles in both browser and Wails builds.
 
+Workspace sessions also store the right inspector’s visibility, active tab and width. `web/src/inspector.js` saves changes immediately through `/api/session` and `web/src/main.js` restores them during startup without overwriting the saved state. This uses the per-workspace session file rather than origin-dependent browser storage, so Wails restarts retain the layout.
+
 The browser's file tabs are managed in `web/src/tabs.js`. Tab context-menu actions and the tab close button share cache cleanup. A bulk close updates the browser view and session once after removing the selected tabs.
 
 ## 2. Startup Pipeline (<1 ms Critical Path)

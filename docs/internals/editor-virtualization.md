@@ -4,6 +4,8 @@ This document provides a comprehensive technical breakdown of px0's bespoke virt
 
 The sidebar file tree uses a separate on-demand rendering path in [`web/src/tree.js`](../../web/src/tree.js). Its Expand All control loads indexed directory children in batches of four requests, skips ignored subtrees, and can be cancelled without allowing late responses to reopen collapsed folders. The editor viewport virtualization described below runs independently of the sidebar tree state. Folder icon states use dedicated `fi-closed` and `fi-open` classes; the editor’s `.c` class is reserved for code cells.
 
+The right inspector restores its visibility, selected tab and width from the workspace session. Closing the Threads panel keeps it closed after relaunch; reopening it retains the selected inspector tab.
+
 The tab bar is managed by [`web/src/tabs.js`](../../web/src/tabs.js). Its right-click menu closes selected groups in descending index order. Single and bulk actions share cache cleanup and active-tab selection, then redraw the tab bar and editor and persist the session once per action.
 
 ## 1. Why a Bespoke Virtualized Viewer?

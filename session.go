@@ -22,16 +22,23 @@ type SessionTab struct {
 	Ref  string `json:"ref,omitempty"`
 }
 
+type SessionInspector struct {
+	Hidden bool   `json:"hidden"`
+	Tab    string `json:"tab"`
+	Width  int    `json:"width"`
+}
+
 // WorkspaceSession stores the persistent UI state for a workspace:
 // the list of open tabs, the currently active tab index, expanded directory tree paths,
-// the sidebar view ("files" or "git"; empty until the user picks one), and any
+// the sidebar view ("files" or "git"; empty until the user picks one), inspector layout, and any
 // unsaved PR review comment drafts.
 type WorkspaceSession struct {
-	Tabs     []SessionTab `json:"tabs"`
-	Active   int          `json:"active"`
-	OpenDirs []string     `json:"openDirs"`
-	Sidebar  string       `json:"sidebar,omitempty"`
-	Drafts   []prComment  `json:"drafts,omitempty"`
+	Tabs      []SessionTab      `json:"tabs"`
+	Active    int               `json:"active"`
+	OpenDirs  []string          `json:"openDirs"`
+	Sidebar   string            `json:"sidebar,omitempty"`
+	Drafts    []prComment       `json:"drafts,omitempty"`
+	Inspector *SessionInspector `json:"inspector,omitempty"`
 }
 
 // sessionFilePath returns the path to the JSON file where workspace session state is saved.
@@ -129,7 +136,7 @@ func (sm *sessionManager) Update(fn func(*WorkspaceSession)) WorkspaceSession {
 
 // handleSession handles GET and POST requests for /api/session.
 // GET returns the current workspace session state.
-// POST updates tab list, active tab, and open directories, saving changes to disk.
+// POST updates workspace UI fields supplied by the client and saves them to disk.
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -139,10 +146,11 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var payload struct {
-			Tabs     *[]SessionTab `json:"tabs"`
-			Active   *int          `json:"active"`
-			OpenDirs *[]string     `json:"openDirs"`
-			Sidebar  *string       `json:"sidebar"`
+			Tabs      *[]SessionTab     `json:"tabs"`
+			Active    *int              `json:"active"`
+			OpenDirs  *[]string         `json:"openDirs"`
+			Sidebar   *string           `json:"sidebar"`
+			Inspector *SessionInspector `json:"inspector"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
 			fail(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -160,6 +168,12 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			}
 			if payload.Sidebar != nil && (*payload.Sidebar == "files" || *payload.Sidebar == "git") {
 				ws.Sidebar = *payload.Sidebar
+			}
+			if inspector := payload.Inspector; inspector != nil && inspector.Width >= 200 && inspector.Width <= 700 {
+				switch inspector.Tab {
+				case "threads", "refs", "symbols", "calls", "search":
+					ws.Inspector = inspector
+				}
 			}
 		})
 		writeJSON(w, updated)
