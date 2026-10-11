@@ -26,6 +26,7 @@ func (h *deskHandler) open(root string) {
 	ix := NewIndex(root)
 	lsp := newLSPManager(root, true)
 	srv := NewServer(ix, lsp)
+	srv.gitWatcher.SetIdlePolicy()
 	if ag, err := newAgentManager(root, "", lsp); err == nil {
 		srv.SetAgent(ag)
 	}

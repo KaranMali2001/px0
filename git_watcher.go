@@ -46,6 +46,10 @@ type GitWatcher struct {
 
 	triggerCh chan struct{}
 	stopCh    chan struct{}
+	// idleCh hands the running loop an idle policy (desktop only); idle is
+	// the installed one, so SetForeground can reach it.
+	idleCh chan *idlePolicy
+	idle   atomic.Pointer[idlePolicy]
 
 	lastIndexMod   time.Time
 	lastIndexSize  int64
@@ -64,6 +68,7 @@ func NewGitWatcher(ix *Index) *GitWatcher {
 		clients:        make(map[chan []byte]struct{}),
 		triggerCh:      make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
+		idleCh:         make(chan *idlePolicy, 1),
 		lastHeadCommit: gitHeadCommit(ix.Root()),
 	}
 	return gw
@@ -131,11 +136,18 @@ func (gw *GitWatcher) recordGitMeta(gitdir string) bool {
 	return changed
 }
 
+// Upstream (CLI) polling intervals. The desktop idle policy never touches these.
+const (
+	gitMetaPoll        = 1 * time.Second
+	gitWorktreePollMin = 1 * time.Second
+	gitWorktreePollMax = 10 * time.Second
+)
+
 func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
-	metaTicker := time.NewTicker(1 * time.Second)
+	metaTicker := time.NewTicker(gitMetaPoll)
 	defer metaTicker.Stop()
 
-	adaptiveInterval := 1 * time.Second
+	adaptiveInterval := gitWorktreePollMin
 	worktreeTicker := time.NewTicker(adaptiveInterval)
 	defer worktreeTicker.Stop()
 
@@ -163,10 +175,10 @@ func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
 				dur := gw.checkAndBroadcast()
 				// Adapt interval based on execution speed: min 1s, max 10s.
 				newInterval := dur * 5
-				if newInterval < 1*time.Second {
-					newInterval = 1 * time.Second
-				} else if newInterval > 10*time.Second {
-					newInterval = 10 * time.Second
+				if newInterval < gitWorktreePollMin {
+					newInterval = gitWorktreePollMin
+				} else if newInterval > gitWorktreePollMax {
+					newInterval = gitWorktreePollMax
 				}
 				if newInterval != adaptiveInterval {
 					adaptiveInterval = newInterval
@@ -186,6 +198,134 @@ func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
 
 		case <-heartbeatTicker.C:
 			gw.broadcast([]byte(": ping\n\n"))
+
+		case p := <-gw.idleCh:
+			gw.idleLoop(ctx, gitdir, p)
+			return
+		}
+	}
+}
+
+// Desktop idle policy: with nothing changing, polling backs off from
+// idleBase, doubling every idleStep quiet ticks up to idleCap; any change
+// snaps it back to idleBase. In the background it polls every idleCap.
+const (
+	idleBase = 1 * time.Second
+	idleCap  = 5 * time.Second
+	idleStep = 3
+)
+
+type idlePolicy struct {
+	mu         sync.Mutex
+	quiet      int
+	background bool
+}
+
+// next records whether the last poll saw a change and returns the delay
+// until the following poll.
+func (p *idlePolicy) next(changed bool) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if changed {
+		p.quiet = 0
+	} else if p.quiet < idleStep*3 {
+		p.quiet++
+	}
+	if p.background {
+		return idleCap
+	}
+	if d := idleBase << (p.quiet / idleStep); d < idleCap {
+		return d
+	}
+	return idleCap
+}
+
+func (p *idlePolicy) setForeground(fg bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.background = !fg
+	if fg {
+		p.quiet = 0
+	}
+}
+
+// SetIdlePolicy switches the watcher to the desktop idle policy. The CLI
+// server never calls it and keeps the upstream fixed-interval polling.
+func (gw *GitWatcher) SetIdlePolicy() {
+	p := &idlePolicy{}
+	if !gw.idle.CompareAndSwap(nil, p) {
+		return
+	}
+	gw.idleCh <- p
+}
+
+// SetForeground reports whether the app window is visible and focused.
+// Coming to the foreground refreshes immediately and resumes fast polling.
+func (gw *GitWatcher) SetForeground(fg bool) {
+	p := gw.idle.Load()
+	if p == nil {
+		return
+	}
+	p.setForeground(fg)
+	if fg {
+		gw.Trigger()
+	}
+}
+
+// idleLoop is loop under the desktop idle policy: one timer drives both the
+// metadata and worktree checks so a quiet repo costs a few stats every
+// idleCap instead of a git run every second.
+func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy) {
+	timer := time.NewTimer(idleBase)
+	defer timer.Stop()
+
+	heartbeatTicker := time.NewTicker(15 * time.Second)
+	defer heartbeatTicker.Stop()
+
+	// The upstream adaptive floor still applies so a slow repo is not
+	// re-scanned faster than five times its scan duration.
+	reset := func(changed bool, dur time.Duration) {
+		d := p.next(changed)
+		if floor := dur * 5; floor > d {
+			d = floor
+			if d > gitWorktreePollMax {
+				d = gitWorktreePollMax
+			}
+		}
+		timer.Reset(d)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-gw.stopCh:
+			return
+
+		case <-timer.C:
+			changed := gw.recordGitMeta(gitdir)
+			var dur time.Duration
+			if gw.active.Load() > 0 || changed {
+				start := time.Now()
+				_, refreshed := gw.refresh()
+				dur = time.Since(start)
+				changed = changed || refreshed
+			}
+			reset(changed, dur)
+
+		case <-gw.triggerCh:
+			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-gw.triggerCh:
+			default:
+			}
+			gw.recordGitMeta(gitdir)
+			start := time.Now()
+			_, changed := gw.refresh()
+			reset(changed, time.Since(start))
+
+		case <-heartbeatTicker.C:
+			gw.broadcast([]byte(": ping\n\n"))
 		}
 	}
 }
@@ -193,6 +333,12 @@ func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
 // Refresh runs an immediate UpdateGitStatus, broadcasts to subscribers if changed,
 // and returns the latest git status payload.
 func (gw *GitWatcher) Refresh() GitStatusPayload {
+	payload, _ := gw.refresh()
+	return payload
+}
+
+// refresh is Refresh that also reports whether anything changed.
+func (gw *GitWatcher) refresh() (GitStatusPayload, bool) {
 	count, files, changed, statuses, dirtyDirs, staged, yourStatuses, yourDirtyDirs := gw.ix.UpdateGitStatus()
 	var recentCommits []GitCommit
 	var ahead, behind int
@@ -236,7 +382,7 @@ func (gw *GitWatcher) Refresh() GitStatusPayload {
 			gw.broadcast(msg)
 		}
 	}
-	return payload
+	return payload, changed
 }
 
 // aheadBehind counts local commits not yet on the remote. In a PR review the
