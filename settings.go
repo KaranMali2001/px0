@@ -169,6 +169,15 @@ var settingsSchema = []settingSchemaItem{
 		},
 	},
 	{
+		Key:         "workbench.iconTheme",
+		Title:       "File Icon Theme",
+		Description: "Icons for files and folders: Material Icon Theme, or px0's minimal colour dots.",
+		Category:    "Workbench",
+		Type:        "select",
+		Default:     "material",
+		Options:     []string{"material", "minimal"},
+	},
+	{
 		Key:         "diffEditor.renderSideBySide",
 		Title:       "Diff Side By Side",
 		Description: "Controls whether the diff editor shows changes in split (side-by-side) or unified mode.",

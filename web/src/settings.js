@@ -158,6 +158,15 @@ const BUILTIN_SCHEMA = [
     ]
   },
   {
+    key: "workbench.iconTheme",
+    title: "File Icon Theme",
+    description: "Icons for files and folders: Material Icon Theme, or px0's minimal colour dots.",
+    category: "Workbench",
+    type: "select",
+    default: "material",
+    options: ["material", "minimal"]
+  },
+  {
     key: "diffEditor.renderSideBySide",
     title: "Diff Side By Side",
     description: "Controls whether the diff editor shows changes in split (side-by-side) or unified mode.",
@@ -307,6 +316,7 @@ let settingsFilterQuery = '';
 const COMMONLY_USED_KEYS = new Set([
   'editor.fontSize',
   'workbench.colorTheme',
+  'workbench.iconTheme',
   'editor.wordWrap',
   'editor.lineNumbers',
   'editor.vimMode',
@@ -406,6 +416,10 @@ export function applySettingLive(key, val, fromUser = false) {
     }
     case 'git.gutterIndicators': {
       document.body.classList.toggle('hide-git-gutter', val === false || val === 'false');
+      break;
+    }
+    case 'workbench.iconTheme': {
+      document.body.classList.toggle('icons-minimal', val === 'minimal');
       break;
     }
     case 'editor.minimap.enabled': {

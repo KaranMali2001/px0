@@ -163,6 +163,15 @@ body.side-hidden #side, body.side-hidden #resizer { display: none; }
 .tr.ignored .nm { color: var(--faint); }
 .tr.ignored .ic, .tr.ignored .ar { opacity: .45; }
 .tr.ignored:hover .nm, .tr.ignored.sel .nm { color: var(--dim); }
+/* Material Icon Theme icons; the colour dot is the fallback (and the
+   "minimal" icon theme). A folder carries a closed and an open icon. */
+.tr .fi, .tab .fi { width: 15px; height: 15px; flex: none; }
+.tab .fi { margin-right: 5px; vertical-align: -3px; }
+.tr .fi ~ .ic, .tr.dir .fi.o, .tr.dir.open .fi.c { display: none; }
+.tr.dir.open .fi.o { display: block; }
+.tr.ignored .fi { opacity: .45; }
+body.icons-minimal .fi { display: none !important; }
+body.icons-minimal .tr .fi ~ .ic { display: block; }
 /* Changes as a list: the folder trails the name and gives way first. */
 .tr .dp { min-width: 0; flex: 0 100 auto; overflow: hidden; text-overflow: ellipsis; color: var(--faint); font-size: 11.5px; }
 .tr .nm { flex: 0 1 auto; min-width: 0; }

@@ -6,6 +6,7 @@ import { showToast, copyToClipboard } from './ui.js';
 import { closeSelMenu } from './selbar.js';
 import { emit, on } from './bus.js';
 import { isAutoRevealEnabled } from './settings.js';
+import { fileIconHTML, folderIconHTML } from './icons.js';
 
 export const treeEl = $('#tree');
 const treeMenu = $('#tree-menu');
@@ -53,7 +54,7 @@ export async function drawTree(dir, container, depth, isCurrent) {
       const dc = c.dirty ? ' dirty' : ''; // backend marks any ancestor of a change
       const ydc = c.yourDirty ? ' your-dirty' : '';
       return '<div class="tw"><div class="tr dir' + ig + dc + ydc + '" data-dir="' + esc(c.path) + '" style="padding-left:' + pad + 'px" title="Folder: ' + esc(c.path) + note + '">' +
-        '<span class="ar"></span><span class="nm">' + esc(c.name) + '</span>' + MENU_BTN + '</div>' +
+        '<span class="ar"></span>' + folderIconHTML(c.name) + '<span class="nm">' + esc(c.name) + '</span>' + MENU_BTN + '</div>' +
         '<div class="kids" data-kids="' + esc(c.path) + '"></div></div>';
     }
     return fileRowHTML(c, pad + 12, ig, note, '');
@@ -74,7 +75,7 @@ function fileRowHTML(c, pad, ig, note, after) {
   const showTick = S.meta?.pr ? isYou : !!g;
   const tick = showTick ? '<button class="stage-tick' + (c.staged ? ' staged' : '') + '" data-stage="' + esc(c.path) + '" title="' + (c.staged ? 'Unstage' : 'Stage') + '"></button>' : '';
   return '<div class="tr file' + ig + gc + yc + '" data-file="' + esc(c.path) + '"' + (c.status ? ' data-st="' + esc(c.status) + '"' : '') + (c.yourStatus ? ' data-yst="' + esc(c.yourStatus) + '"' : '') + ' style="padding-left:' + pad + 'px" title="Open ' + esc(c.path) + note + '">' +
-    '<span class="ic" data-t="' + fileKind(c.name) + '"></span><span class="nm">' + esc(c.name) + '</span>' + after + badge + tick + MENU_BTN + '</div>';
+    fileIconHTML(c.name) + '<span class="ic" data-t="' + fileKind(c.name) + '"></span><span class="nm">' + esc(c.name) + '</span>' + after + badge + tick + MENU_BTN + '</div>';
 }
 
 /* Git view lists changed files flat by default -- file name, then its folder --

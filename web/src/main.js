@@ -15,6 +15,7 @@ import { initFind } from './find.js';
 import { initPalette } from './palette.js';
 import { initShortcuts } from './shortcuts.js';
 import { initTheme } from './theme.js';
+import { loadIcons } from './icons.js';
 import { initMarkdown } from './markdown.js';
 import { initDiff } from './diff.js';
 import { initAgent, applyAgentMeta, loadAgentAsync } from './agent.js';
@@ -114,6 +115,7 @@ initPRScope();
     }
     savedSidebar = session?.sidebar || '';
   } catch {}
+  await loadIcons();
   await refreshTree();
   initGitStream();
 
