@@ -167,8 +167,8 @@ body.side-hidden #side, body.side-hidden #resizer { display: none; }
    "minimal" icon theme). A folder carries a closed and an open icon. */
 .tr .fi, .tab .fi { width: 15px; height: 15px; flex: none; }
 .tab .fi { margin-right: 5px; vertical-align: -3px; }
-.tr .fi ~ .ic, .tr.dir .fi.o, .tr.dir.open .fi.c { display: none; }
-.tr.dir.open .fi.o { display: block; }
+.tr .fi ~ .ic, .tr.dir .fi-open, .tr.dir.open .fi-closed { display: none; }
+.tr.dir.open .fi-open { display: block; }
 .tr.ignored .fi { opacity: .45; }
 body.icons-minimal .fi { display: none !important; }
 body.icons-minimal .tr .fi ~ .ic { display: block; }

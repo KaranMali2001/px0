@@ -51,6 +51,6 @@ export const fileIconHTML = name => {
 export const folderIconHTML = name => {
   const srcs = folderIconURLs(name);
   return srcs
-    ? '<img class="fi c" src="' + srcs[0] + '" alt="" draggable="false"><img class="fi o" src="' + srcs[1] + '" alt="" draggable="false" loading="lazy">'
+    ? '<img class="fi fi-closed" src="' + srcs[0] + '" alt="" draggable="false"><img class="fi fi-open" src="' + srcs[1] + '" alt="" draggable="false" loading="lazy">'
     : '';
 };

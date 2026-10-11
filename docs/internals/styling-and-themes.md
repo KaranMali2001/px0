@@ -17,6 +17,8 @@ px0 reads every colour in the user interface through a CSS custom property, know
 
 The explorer header controls use the same tokenized `.mini` button style as Re-index. The Expand All progress state uses accent tokens; its pulse runs only when the browser allows motion, and keyboard focus uses a visible tokenized outline.
 
+Explorer folder icons use `fi-closed` and `fi-open` classes to switch with the row’s expanded state. These classes stay separate from the editor’s `.c` code-cell layout, keeping both icon states at 15px without code-cell padding. `workbench.iconTheme` selects bundled Material icons or the minimal colour dots.
+
 ## 2. Built-in Themes
 
 | Name             | ID                 | Scheme | Inspiration / Palette                  |
