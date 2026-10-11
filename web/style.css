@@ -1,6 +1,9 @@
-/* Wails titlebar is hidden-inset: clear the traffic lights and let the sidebar header drag the window. */
-html.desktop #side header.panel-head { padding-top: 36px; --wails-draggable: drag; }
-html.desktop #side header.panel-head :is(button, a, input) { --wails-draggable: no-drag; }
+/* Desktop titlebar is hidden (standard 28px height): the traffic lights sit in the
+   first 28px row, so whichever bar is under them shares that row and drags the window. */
+html.desktop #side header.panel-head { height: 28px; padding: 0 12px 0 80px; --wails-draggable: drag; }
+html.desktop #tabs { --wails-draggable: drag; }
+html.desktop #tabs:empty { display: flex; }
+html.desktop :is(#side header.panel-head, #tabs) :is(button, a, input, .tab) { --wails-draggable: no-drag; }
 
 /* Colours are never written in this file: every one is read through a token.
    Themes live in web/themes/<id>.css and are served joined as /static/themes.css.
@@ -706,21 +709,15 @@ body.right-hidden #right-side, body.right-hidden #right-resizer { display: none;
 
 /* ---------- main ---------- */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
-html.desktop #main { padding-top: 28px; }
-html.desktop #view-switches { top: 31px; }
-html.desktop body.side-right #main,
-html.desktop body.side-hidden #main { padding-top: 40px; }
-html.desktop body.side-right #view-switches,
-html.desktop body.side-hidden #view-switches { top: 43px; }
 html.desktop body.side-right #tabs,
-html.desktop body.side-hidden #tabs { padding-left: 88px; scroll-padding-left: 88px; }
+html.desktop body.side-hidden #tabs { padding-left: 80px; scroll-padding-left: 80px; }
 /* workbench.sideBar.location is a desktop-only setting; side-right is only ever set under html.desktop. */
 html.desktop body.side-right #main { order: 1; }
 html.desktop body.side-right #resizer { order: 2; margin-left: 0; margin-right: -2px; }
 html.desktop body.side-right #side { order: 3; border-right: 0; border-left: 1px solid var(--line); }
 html.desktop body.side-right #right-resizer { order: 4; }
 html.desktop body.side-right #right-side { order: 5; }
-html.desktop body.side-right #side header.panel-head { padding-top: 9px; }
+html.desktop body.side-right #side header.panel-head { height: auto; padding: 9px 12px 7px; }
 /* View-mode switches (Markdown Preview/Source, git Diff), pinned to the right
    of the tab bar. The bar pads its end so the last tab can scroll clear of them. */
 .open-right {

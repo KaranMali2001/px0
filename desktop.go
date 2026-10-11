@@ -70,7 +70,7 @@ func main() {
 			Handler: h,
 		},
 		Mac: &mac.Options{
-			TitleBar:             mac.TitleBarHiddenInset(),
+			TitleBar:             mac.TitleBarHidden(),
 			Appearance:           mac.DefaultAppearance,
 			WebviewIsTransparent: true,
 			WindowIsTranslucent:  true,
