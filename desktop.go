@@ -31,7 +31,10 @@ func (h *deskHandler) open(root string) {
 		srv.SetAgent(ag)
 	}
 	h.install(srv)
-	go ix.Build()
+	go func() {
+		defer userActivity()()
+		ix.Build()
+	}()
 	rememberFolder(root)
 }
 

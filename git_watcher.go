@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -278,6 +279,9 @@ type idlePolicy struct {
 	background bool
 	nextFull   time.Time
 	floor      time.Duration
+	// safety, when set, replaces the foreground backoff: change notifications
+	// report edits, so a full refresh only backstops dropped events.
+	safety time.Duration
 }
 
 // next records whether the last refresh saw a change and returns the
@@ -296,6 +300,9 @@ func (p *idlePolicy) nextLocked(changed bool) time.Duration {
 	}
 	if p.background {
 		return idleCap
+	}
+	if p.safety > 0 {
+		return p.safety
 	}
 	if d := idleBase << (p.quiet / idleStep); d < idleCap {
 		return d
@@ -457,10 +464,37 @@ func (gw *GitWatcher) SetForeground(fg bool) {
 	}
 }
 
+// treeEvent is a batch of directories, relative to the root, whose entries
+// changed. Rescan means notifications were dropped, so anything may have.
+type treeEvent struct {
+	Dirs   []string
+	Rescan bool
+}
+
+// startTreeEvents, when set (FSEvents in the macOS desktop build), replaces
+// the idle policy's worktree polling with change notifications.
+var startTreeEvents func(root string) (<-chan treeEvent, func(), error)
+
+// eventSafety is the foreground full-refresh interval under notifications.
+const eventSafety = time.Minute
+
 // idleLoop is loop under the desktop idle policy: one timer drives both the
 // metadata and worktree checks, and git only runs when they see a change or
-// the backoff says a full refresh is due.
+// the backoff says a full refresh is due. With change notifications the
+// timer only stats .git metadata, which notifications do not cover when the
+// git dir lives outside the root.
 func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy) {
+	var events <-chan treeEvent
+	if startTreeEvents != nil {
+		if ch, stop, err := startTreeEvents(gw.root); err == nil {
+			events = ch
+			defer stop()
+			p.mu.Lock()
+			p.safety = eventSafety
+			p.mu.Unlock()
+		}
+	}
+
 	timer := time.NewTimer(idleBase)
 	defer timer.Stop()
 
@@ -468,10 +502,15 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 	defer heartbeatTicker.Stop()
 
 	var scan worktreeScan
-	scan.tick(gw.ix)
+	if events == nil {
+		scan.tick(gw.ix)
+	}
+	var lastRefresh time.Time
+	pending := false
 	refresh := func(now time.Time, metaChanged bool) {
 		_, changed := gw.refresh()
 		p.refreshed(now, metaChanged || changed, time.Since(now))
+		lastRefresh, pending = time.Now(), false
 	}
 
 	for {
@@ -482,11 +521,17 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 			return
 
 		case <-timer.C:
+			if !gw.ix.Ready() {
+				timer.Reset(idleBase)
+				continue
+			}
 			now := time.Now()
 			changed := gw.recordGitMeta(gitdir)
 			var statDur time.Duration
 			listening := gw.active.Load() > 0
-			if listening {
+			if events != nil {
+				changed = changed || pending && listening
+			} else if listening {
 				changed = scan.tick(gw.ix) || changed
 				statDur = time.Since(now)
 			}
@@ -495,6 +540,22 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 			}
 			timer.Reset(p.interval(statDur))
 
+		case ev := <-events:
+			if !gw.relevant(ev) {
+				continue
+			}
+			pending = true
+			if gw.active.Load() == 0 {
+				continue // the focus refresh picks it up
+			}
+			// At most one git run per idleBase, however busy the tree is.
+			if wait := idleBase - time.Since(lastRefresh); wait > 0 {
+				timer.Reset(wait)
+				continue
+			}
+			refresh(time.Now(), true)
+			timer.Reset(p.interval(0))
+
 		case <-gw.triggerCh:
 			time.Sleep(50 * time.Millisecond)
 			select {
@@ -502,12 +563,59 @@ func (gw *GitWatcher) idleLoop(ctx context.Context, gitdir string, p *idlePolicy
 			default:
 			}
 			gw.recordGitMeta(gitdir)
-			scan.tick(gw.ix)
+			if events == nil {
+				scan.tick(gw.ix)
+			}
 			refresh(time.Now(), false)
 			timer.Reset(p.interval(0))
 
 		case <-heartbeatTicker.C:
 			gw.broadcast([]byte(": ping\n\n"))
+		}
+	}
+}
+
+// relevant reports whether a change notification can affect git status:
+// changes inside .git are covered by recordGitMeta, and directories the
+// index skipped as ignored cannot change it.
+func (gw *GitWatcher) relevant(ev treeEvent) bool {
+	if ev.Rescan {
+		return true
+	}
+	gw.ix.mu.RLock()
+	defer gw.ix.mu.RUnlock()
+	for _, d := range ev.Dirs {
+		if d == ".git" || strings.HasPrefix(d, ".git/") {
+			continue
+		}
+		if _, ok := gw.ix.children[d]; ok || !gw.ix.underIgnoredLocked(d) {
+			return true
+		}
+	}
+	return false
+}
+
+func statusMsg(payload GitStatusPayload) []byte {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return []byte(fmt.Sprintf("event: git-status\ndata: %s\n\n", data))
+}
+
+func (gw *GitWatcher) sendWhenReady(ch chan []byte) {
+	select {
+	case <-gw.ix.readyCh:
+	case <-gw.stopCh:
+		return
+	}
+	msg := statusMsg(gw.Refresh())
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	if _, ok := gw.clients[ch]; ok && msg != nil {
+		select {
+		case ch <- msg:
+		default:
 		}
 	}
 }
@@ -613,11 +721,12 @@ func (gw *GitWatcher) Subscribe() (<-chan []byte, func()) {
 	// Immediately send current state to newly connected client
 	inGit := gitAvailable(gw.root)
 	var initialMsg []byte
-	if inGit {
-		payload := gw.Refresh()
-		if data, err := json.Marshal(payload); err == nil {
-			initialMsg = []byte(fmt.Sprintf("event: git-status\ndata: %s\n\n", data))
-		}
+	if inGit && !gw.ix.Ready() {
+		// The index build runs git status itself; another run now would race
+		// its tree walk for the disk. This client gets the state once it is in.
+		go gw.sendWhenReady(ch)
+	} else if inGit {
+		initialMsg = statusMsg(gw.Refresh())
 	} else {
 		payload := GitStatusPayload{
 			Git:        false,

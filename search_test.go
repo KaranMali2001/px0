@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -69,5 +73,76 @@ func TestHandleSearchWithCanceledRequest(t *testing.T) {
 	// Since context was canceled, handleSearch should return cleanly without writing a 400 error
 	if rec.Code == http.StatusBadRequest {
 		t.Fatalf("expected canceled search to return quietly, got status %d", rec.Code)
+	}
+}
+
+func TestSearchLargeFilesStreamed(t *testing.T) {
+	root := t.TempDir()
+	write := func(name string, b []byte) {
+		if err := os.WriteFile(filepath.Join(root, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line := []byte(strings.Repeat("x", 63) + "\n")
+	filler := bytes.Repeat(line, (rejectChunk*2)/len(line))
+
+	// The needle straddles the first chunk boundary, in a different case.
+	straddle := append([]byte{}, filler[:rejectChunk-3]...)
+	straddle = append(straddle, "NeedleWord\n"...)
+	straddle = append(straddle, filler...)
+	write("straddle.txt", straddle)
+	write("none.txt", filler)
+	bin := append([]byte{0}, filler...)
+	write("binary.txt", append(bin, "needleword\n"...))
+	write("small.txt", []byte("a needleword here\n"))
+
+	ix := NewIndex(root)
+	ix.Build()
+	res, _, err := Search(ix, SearchOpts{Query: "needleword"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, f := range res {
+		got[f.Path] = f.Matches[0].Line
+	}
+	wantLine := bytes.Count(straddle[:rejectChunk-3], []byte("\n")) + 1
+	if len(got) != 2 || got["small.txt"] != 1 || got["straddle.txt"] != wantLine {
+		t.Fatalf("got %v, want small.txt:1 and straddle.txt:%d", got, wantLine)
+	}
+
+	res, _, err = Search(ix, SearchOpts{Query: "needleword", Case: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Path != "small.txt" {
+		t.Fatalf("case-sensitive search must skip NeedleWord, got %+v", res)
+	}
+}
+
+// Rejecting large non-matching files must not allocate a buffer per file.
+func TestSearchLargeFilesRejectWithoutAllocating(t *testing.T) {
+	root := t.TempDir()
+	big := bytes.Repeat([]byte(strings.Repeat("y", 63)+"\n"), (2<<20)/64)
+	for i := range 8 {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("big%d.txt", i)), big, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ix := NewIndex(root)
+	ix.Build()
+	search := func() {
+		if _, _, err := Search(ix, SearchOpts{Query: "zzqqxx_no_such_token"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	search()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	search()
+	runtime.ReadMemStats(&after)
+	// Whole-file reads would allocate 8 x 2 MB twice (read + case fold).
+	if got := after.TotalAlloc - before.TotalAlloc; got > 4<<20 {
+		t.Fatalf("search over 16 MB of non-matching files allocated %d bytes", got)
 	}
 }

@@ -470,3 +470,128 @@ func BenchmarkWorktreeCheapTick(b *testing.B) {
 		s.tick(ix)
 	}
 }
+
+func TestTreeEventRelevance(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"src", "build/out"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("build/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ix := NewIndex(root)
+	ix.Build()
+	gw := NewGitWatcher(ix)
+
+	for _, c := range []struct {
+		ev   treeEvent
+		want bool
+	}{
+		{treeEvent{Dirs: []string{""}}, true},
+		{treeEvent{Dirs: []string{"src"}}, true},
+		{treeEvent{Dirs: []string{"src/new"}}, true},
+		{treeEvent{Dirs: []string{".git"}}, false},
+		{treeEvent{Dirs: []string{".git/refs/heads"}}, false},
+		{treeEvent{Dirs: []string{"build"}}, false},
+		{treeEvent{Dirs: []string{"build/out"}}, false},
+		{treeEvent{Dirs: []string{"build/out", "src"}}, true},
+		{treeEvent{Rescan: true}, true},
+	} {
+		if got := gw.relevant(c.ev); got != c.want {
+			t.Errorf("relevant(%+v) = %v, want %v", c.ev, got, c.want)
+		}
+	}
+}
+
+// With change notifications the watcher must not wait for the backoff: an
+// event alone delivers the change.
+func TestIdlePolicyTreeEventsRefresh(t *testing.T) {
+	if !gitInstalled() {
+		t.Skip("git not installed")
+	}
+	events := make(chan treeEvent, 1)
+	stopped := make(chan struct{})
+	defer func(f func(string) (<-chan treeEvent, func(), error)) { startTreeEvents = f }(startTreeEvents)
+	startTreeEvents = func(string) (<-chan treeEvent, func(), error) {
+		return events, func() { close(stopped) }, nil
+	}
+
+	root := gitRepo(t)
+	ix := NewIndex(root)
+	ix.Build()
+	gw := NewGitWatcher(ix)
+	gw.Start(t.Context())
+	gw.SetIdlePolicy()
+	ch, cancel := gw.Subscribe()
+	defer cancel()
+	<-ch
+	time.Sleep(1200 * time.Millisecond)
+	p := gw.idle.Load()
+	p.mu.Lock()
+	if p.safety != eventSafety {
+		p.mu.Unlock()
+		t.Fatalf("event mode must use the safety interval, got %v", p.safety)
+	}
+	p.nextFull = time.Now().Add(time.Hour)
+	p.mu.Unlock()
+	for len(ch) > 0 {
+		<-ch
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "ev_new.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	events <- treeEvent{Dirs: []string{""}}
+	deadline := time.After(1500 * time.Millisecond)
+	for found := false; !found; {
+		select {
+		case msg := <-ch:
+			found = strings.Contains(string(msg), "ev_new.txt")
+		case <-deadline:
+			t.Fatal("tree event did not refresh git status within 1.5s")
+		}
+	}
+
+	gw.Stop()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopping the watcher must stop the event source")
+	}
+}
+
+// A client connecting mid-build gets its git status when the index is in,
+// without a git run racing the build's tree walk.
+func TestSubscribeBeforeIndexReady(t *testing.T) {
+	if !gitInstalled() {
+		t.Skip("git not installed")
+	}
+	root := gitRepo(t)
+	if err := os.WriteFile(filepath.Join(root, "early.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ix := NewIndex(root)
+	gw := NewGitWatcher(ix)
+	defer gw.Stop()
+	ch, cancel := gw.Subscribe()
+	defer cancel()
+	select {
+	case msg := <-ch:
+		t.Fatalf("status sent before the index was ready: %.80s", msg)
+	case <-time.After(200 * time.Millisecond):
+	}
+	ix.Build()
+	select {
+	case msg := <-ch:
+		if !strings.Contains(string(msg), "early.txt") {
+			t.Fatalf("initial status missing early.txt: %.200s", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no initial status after the index became ready")
+	}
+}

@@ -146,6 +146,62 @@ func newSearcher(o SearchOpts) (*searcher, error) {
 type workBuf struct {
 	read  []byte
 	lower []byte
+	chunk []byte
+}
+
+// workBufs carries scratch across searches, so a search-as-you-type burst
+// does not regrow every worker's buffers per keystroke.
+var workBufs = sync.Pool{New: func() any { return &workBuf{} }}
+
+// rejectChunk is the size above which a literal search streams a file through
+// a fixed buffer to reject it, rather than reading it whole. Most files do not
+// match, and the whole-file read would allocate a buffer per large file.
+const rejectChunk = 256 << 10
+
+// mayMatch reports whether the literal needle occurs in the file, reading it
+// rejectChunk at a time. Binary files (NUL in the first 8000 bytes) never match.
+func (s *searcher) mayMatch(path string, w *workBuf) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	keep := len(s.lit) - 1
+	if cap(w.chunk) < rejectChunk+keep {
+		w.chunk = make([]byte, rejectChunk+keep)
+	}
+	buf := w.chunk[:cap(w.chunk)]
+	carried := 0
+	for first := true; ; first = false {
+		n, err := io.ReadFull(f, buf[carried:carried+rejectChunk])
+		data := buf[:carried+n]
+		if first && isBinary(data) {
+			return false, nil
+		}
+		if !s.opts.Case {
+			asciiFold(data[carried:])
+		}
+		if bytes.Contains(data, s.lit) {
+			return true, nil
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		// Carry the tail so a match straddling two chunks is still seen.
+		carried = min(keep, len(data))
+		copy(buf, data[len(data)-carried:])
+	}
+}
+
+func asciiFold(b []byte) {
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
 }
 
 // keepBuf is the largest scratch a worker holds on to between files. Reusing a
@@ -325,7 +381,8 @@ func SearchContext(ctx context.Context, ix *Index, o SearchOpts) ([]FileMatches,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w := &workBuf{}
+			w := workBufs.Get().(*workBuf)
+			defer workBufs.Put(w)
 			for i := range jobs {
 				if ctx.Err() != nil {
 					continue // context cancelled: drain jobs and terminate quickly
@@ -340,7 +397,13 @@ func SearchContext(ctx context.Context, ix *Index, o SearchOpts) ([]FileMatches,
 				if int(atomic.LoadInt32(&hit)) >= o.MaxFiles {
 					continue
 				}
-				data, err := readInto(filepath.Join(root, filepath.FromSlash(f.Path)), &w.read, f.Size)
+				path := filepath.Join(root, filepath.FromSlash(f.Path))
+				if s.re == nil && f.Size > rejectChunk {
+					if ok, err := s.mayMatch(path, w); err != nil || !ok {
+						continue
+					}
+				}
+				data, err := readInto(path, &w.read, f.Size)
 				if err != nil || isBinary(data) {
 					continue
 				}
