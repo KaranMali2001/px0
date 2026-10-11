@@ -30,8 +30,7 @@ Requires Go 1.24+. No npm, node, CGO, or external dependencies:
 ```bash
 git clone https://github.com/px0-ai/px0.git
 cd px0
-make build
-install -d ~/.local/bin && install px0 ~/.local/bin/
+make install-cli
 ```
 
 To cross-compile binaries for all supported platforms:
@@ -39,6 +38,22 @@ To cross-compile binaries for all supported platforms:
 ```bash
 make dist
 ```
+
+### Native macOS app
+
+Build and install the optimized universal app locally:
+
+```bash
+make install-local
+```
+
+Use the existing browser workflow with `px0 .`, or open a directory in a new native px0 window with:
+
+```bash
+px0 -d .
+```
+
+`px0 -d` looks for `~/Applications/px0.app`, then `/Applications/px0.app`. Set `PX0_DESKTOP_APP` to use a different local app bundle. The local app and DMG are unsigned and may show a Gatekeeper warning.
 
 ## Features
 
@@ -51,7 +66,7 @@ make dist
 - **Custom Themes**: 14 built-in themes (GitHub Dark, Tokyo Night, Catppuccin, Dracula, Gruvbox, Nord, Solarized, and more).
 - **Optional Language Server Protocol (LSP)**: Zero-config auto-detection (`gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`) for Go-to-Definition (`F12`), Hover, references, and call trails. Falls back automatically to regex outlines.
 - **Settings & Configuration Modal**: Press `Cmd/Ctrl+,` or click the ⚙️ icon in the status bar to open the VS Code-style Settings editor. Configure editor typography, cursor styles, diff modes, themes, search behavior, file exclusions, and coding agents with live preview and raw JSON synchronization (`~/.px0/settings.json`).
-- **Virtual DOM / Zero Overhead**: Opening a 400,000-line file costs the same as a 10-line file; only visible rows are mounted. Reclaims memory after 15 seconds of inactivity.
+- **Bounded Rendering**: Only visible source rows are mounted; browser chunks use an LRU budget, large folders use 500-entry pages, and diffs use 1000-row pages. Cold open scans files up to 64 MiB for exact line counts. Idle navigation triggers Go heap reclamation after 15 seconds (checked every 10 seconds).
 - **Completely Self-Contained**: Single static binary embedding all web assets. Zero runtime dependencies, no Electron, no Node, no cloud phone-homes.
 
 ## Language Server (LSP) Setup (Optional)
@@ -388,3 +403,10 @@ For comprehensive technical deep-dives into the architecture, indexing, virtuali
 ## License
 
 [MIT License](LICENSE) (c) 2026 Arpit Bhayani
+
+
+### Desktop lifecycle and performance scope
+
+Opening another folder closes the previous workspace, cancels indexing and harness/install jobs, and stops its language servers. The login-shell PATH check runs after window startup and is cancelled after three seconds. Native builds require macOS, CGO, Wails, and system frameworks; the CLI remains buildable with `CGO_ENABLED=0`.
+
+The status bar reports the px0 process's OS RSS/CPU where supported and marks unavailable readings. WebKit, language servers, and harness child processes are excluded. Historical CLI benchmark figures above do not measure desktop total memory or guarantee startup/frame times on other systems.

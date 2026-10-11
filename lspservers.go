@@ -155,6 +155,10 @@ const maxLSPRestarts = 3
 type lspManager struct {
 	root    string
 	enabled bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+	closed  bool
+	spawns  sync.WaitGroup
 
 	mu        sync.Mutex
 	byExt     map[string]*lspServerDef // resolved by discover(), again on Rescan
@@ -195,8 +199,10 @@ func (m *lspManager) Allowed(abs string) bool {
 }
 
 func newLSPManager(root string, enabled bool) *lspManager {
+	ctx, cancel := context.WithCancel(context.Background())
 	m := &lspManager{
 		root: root, enabled: enabled,
+		ctx: ctx, cancel: cancel,
 		byExt:    map[string]*lspServerDef{},
 		clients:  map[string]*lspClient{},
 		starting: map[string]chan struct{}{},
@@ -206,7 +212,8 @@ func newLSPManager(root string, enabled bool) *lspManager {
 		return m
 	}
 	// Discover available language servers in background so server startup is instantaneous.
-	go m.discover()
+	m.spawns.Add(1)
+	go func() { defer m.spawns.Done(); m.discover() }()
 	return m
 }
 
@@ -236,7 +243,9 @@ func (m *lspManager) discover() {
 		}
 	}
 	m.mu.Lock()
-	m.byExt, m.available, m.discovered = byExt, available, true
+	if !m.closed {
+		m.byExt, m.available, m.discovered = byExt, available, true
+	}
 	m.mu.Unlock()
 }
 
@@ -360,12 +369,22 @@ func (m *lspManager) State(rel string) (lspState, string) {
 // that cannot wait should pass a short context; the spawn continues regardless
 // so the next request finds it ready.
 func (m *lspManager) client(ctx context.Context, rel string) (*lspClient, error) {
+	m.mu.Lock()
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
+		return nil, context.Canceled
+	}
 	def := m.defFor(rel)
 	if def == nil {
 		return nil, errNoServer
 	}
 	for {
 		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return nil, context.Canceled
+		}
 		if why, bad := m.failed[def.Name]; bad {
 			m.mu.Unlock()
 			return nil, errFailed{why}
@@ -389,8 +408,9 @@ func (m *lspManager) client(ctx context.Context, rel string) (*lspClient, error)
 			}
 			m.restarts[def.Name]++
 			delete(m.clients, def.Name)
+			m.spawns.Add(1)
 			m.mu.Unlock()
-			go c.shutdown()
+			go func() { defer m.spawns.Done(); c.shutdown() }()
 			continue
 		}
 		if wait, ok := m.starting[def.Name]; ok {
@@ -404,6 +424,7 @@ func (m *lspManager) client(ctx context.Context, rel string) (*lspClient, error)
 		}
 		done := make(chan struct{})
 		m.starting[def.Name] = done
+		m.spawns.Add(1)
 		m.mu.Unlock()
 
 		go m.spawn(def, done)
@@ -418,9 +439,14 @@ func (m *lspManager) client(ctx context.Context, rel string) (*lspClient, error)
 }
 
 func (m *lspManager) spawn(def *lspServerDef, done chan struct{}) {
+	defer m.spawns.Done()
 	// The handshake gets a generous budget of its own: some servers do real
 	// work before answering initialize.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
 	c := newLSPClient(*def, m.root)
@@ -429,11 +455,15 @@ func (m *lspManager) spawn(def *lspServerDef, done chan struct{}) {
 	m.mu.Lock()
 	if err != nil {
 		m.failed[def.Name] = err.Error()
-	} else {
+	} else if !m.closed {
 		m.clients[def.Name] = c
 	}
+	closed := m.closed
 	delete(m.starting, def.Name)
 	m.mu.Unlock()
+	if err != nil || closed {
+		c.shutdown()
+	}
 	close(done)
 }
 
@@ -452,15 +482,23 @@ func (m *lspManager) CloseDoc(abs, rel string) {
 
 func (m *lspManager) Close() {
 	m.mu.Lock()
+	m.closed = true
+	if m.cancel != nil {
+		m.cancel()
+	}
 	clients := make([]*lspClient, 0, len(m.clients))
 	for _, c := range m.clients {
 		clients = append(clients, c)
 	}
 	m.clients = map[string]*lspClient{}
 	m.mu.Unlock()
+	var stopped sync.WaitGroup
 	for _, c := range clients {
-		c.shutdown()
+		stopped.Add(1)
+		go func() { defer stopped.Done(); c.shutdown() }()
 	}
+	stopped.Wait()
+	m.spawns.Wait()
 }
 
 type errFailed struct{ why string }

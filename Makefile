@@ -1,4 +1,4 @@
-.PHONY: all build web test dist publish clean help
+.PHONY: all build web test dist publish clean help desktop dmg install-cli install-desktop install-local
 
 VERSION ?= $(shell cat VERSION 2>/dev/null | tr -d ' \r\n')
 # Support 'make publish 0.2.0' where target argument is passed as next goal
@@ -30,6 +30,11 @@ help:
 	@echo "  make test              - run go test suite"
 	@echo "  make dist              - compile cross-platform binaries into dist/"
 	@echo "  make publish <version> - bump VERSION, commit, tag, and build dist binaries"
+	@echo "  make desktop           - build native macOS .app with Wails"
+	@echo "  make dmg               - wrap .app into installable .dmg"
+	@echo "  make install-cli       - install px0 CLI to ~/.local/bin"
+	@echo "  make install-desktop   - install px0.app to ~/Applications"
+	@echo "  make install-local     - install both the CLI and native app"
 	@echo "  make clean             - remove build artifacts"
 
 web:
@@ -67,6 +72,41 @@ publish:
 	@echo "To publish to GitHub and trigger release workflow, run:"
 	@echo "  git push origin master --tags"
 
+desktop: web ## build the native macOS .app (requires wails in PATH)
+	@echo "Building px0.app..."
+	@PATH="$$HOME/go/bin:$$PATH" wails build -tags desktop -platform darwin/universal -clean -s -skipbindings -trimpath -ldflags="$(LDFLAGS)"
+	@/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" build/bin/px0.app/Contents/Info.plist
+	@/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" build/bin/px0.app/Contents/Info.plist
+	@/usr/libexec/PlistBuddy -c "Set :CFBundleGetInfoString px0 $(VERSION)" build/bin/px0.app/Contents/Info.plist
+	@codesign --force --deep --sign - build/bin/px0.app
+	@codesign --verify --deep --strict build/bin/px0.app
+	@echo "Built build/bin/px0.app"
+
+dmg: desktop ## wrap the built .app into a .dmg (requires create-dmg)
+	@rm -f build/bin/px0.dmg build/bin/rw.*.px0.dmg
+	create-dmg \
+	  --volname "px0" \
+	  --window-size 540 380 \
+	  --icon "px0.app" 140 180 \
+	  --app-drop-link 400 180 \
+	  --skip-jenkins \
+	  "build/bin/px0.dmg" "build/bin/px0.app"
+	@echo "Built build/bin/px0.dmg"
+
+install-cli: build ## install the CLI used by px0 -d
+	@mkdir -p "$(HOME)/.local/bin"
+	@install -m 755 px0 "$(HOME)/.local/bin/px0"
+	@echo "Installed $(HOME)/.local/bin/px0"
+
+install-desktop: desktop ## install the native app for px0 -d
+	@mkdir -p "$(HOME)/Applications"
+	@rm -rf "$(HOME)/Applications/px0.app"
+	@ditto build/bin/px0.app "$(HOME)/Applications/px0.app"
+	@codesign --verify --deep --strict "$(HOME)/Applications/px0.app"
+	@echo "Installed $(HOME)/Applications/px0.app"
+
+install-local: install-cli install-desktop ## install the local native workflow
+
 clean:
 	rm -f px0
-	rm -rf dist/
+	rm -rf dist/ build/bin/

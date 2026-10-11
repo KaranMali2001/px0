@@ -7,7 +7,7 @@ This document outlines the step-by-step instructions for preparing, testing, and
 Before cutting a new release, ensure you have:
 
 - Git with push and tag permissions for `px0-ai/px0`.
-- Go (version 1.24+).
+- Go at the version required by `go.mod` (currently 1.25+); CI reads `go-version-file: go.mod`.
 - Node.js (v18+ or v20+) or Bun for bundling frontend assets.
 - A clean working tree with all tests passing.
 
@@ -88,3 +88,12 @@ git push origin v0.2.0
   ```bash
   px0 --update
   ```
+
+
+## Native macOS release
+
+`make desktop` builds a universal Wails `.app`, sets bundle versions, and applies an ad-hoc signature for local use. `make dmg` packages it; these targets require Wails and `create-dmg` respectively, plus Apple's command-line tools/SDK. The desktop build links Cocoa, WebKit, and UniformTypeIdentifiers. The existing GitHub release workflow ships CLI binaries only.
+
+Before a public desktop release, use a Developer ID signature and notarization, then verify supported macOS versions, first launch/folder selection, repeated workspace replacement, shutdown during LSP/install/harness work, fonts/icons, scrolling/caret/selection, and large tree/diff pages. The optional WebKit high-refresh selector is private API and guarded for availability; it is not a cross-version FPS guarantee.
+
+Default Go tests exclude `desktop` files. Obtain approval for exact test commands under AGENTS.md; CLI and native compilation are separate checks. Browser/E2E and performance measurements also require explicit test approval. A successful `go build -tags 'desktop,production'` verifies native compilation but does not replace `.app` signing, runtime, or browser validation.

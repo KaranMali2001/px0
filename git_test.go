@@ -265,14 +265,14 @@ func TestGitGutter(t *testing.T) {
 		t.Errorf("untracked: status=%d available=%v, want 200/false", code, body["available"])
 	}
 
-	// Verify /api/file also reports diffAvailable immediately on file load.
+	// Diff availability belongs to /api/gutter, not scroll chunk reads.
 	_, fileBody := get(t, s, "/api/file?path=f.go")
-	if fileBody["diffAvailable"] != true {
-		t.Errorf("f.go diffAvailable = %v, want true", fileBody["diffAvailable"])
+	if _, ok := fileBody["diffAvailable"]; ok {
+		t.Error("file chunk includes diff availability")
 	}
 	_, cleanBody := get(t, s, "/api/file?path=clean.go")
-	if cleanBody["diffAvailable"] != false {
-		t.Errorf("clean.go diffAvailable = %v, want false", cleanBody["diffAvailable"])
+	if _, ok := cleanBody["diffAvailable"]; ok {
+		t.Error("clean file chunk includes diff availability")
 	}
 }
 

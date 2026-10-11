@@ -157,6 +157,10 @@ func sortNodes(kids []Node) {
 // directory map (for the tree view). Root entries are published immediately so
 // the frontend can display the file tree without waiting for the full repo scan.
 func (ix *Index) Build() {
+	ix.BuildContext(context.Background())
+}
+
+func (ix *Index) BuildContext(ctx context.Context) {
 	start := time.Now()
 	root := newIgnoreSet(nil)
 	root = root.child(readGitignore(ix.root, ""))
@@ -173,11 +177,16 @@ func (ix *Index) Build() {
 	// concurrently with the walk instead of serially after it — on large repos
 	// the ~80ms subprocess overlaps the tree scan rather than adding to it.
 	gsCh := make(chan map[string]string, 1)
-	go func() { gsCh <- gitStatus(ix.root) }()
+	gsDone := make(chan struct{})
+	go func() { defer close(gsDone); gsCh <- gitStatusContext(ctx, ix.root) }()
+	defer func() { <-gsDone }()
 
 	var walk func(abs, rel string, ig *ignoreSet)
 	walk = func(abs, rel string, ig *ignoreSet) {
 		defer wg.Done()
+		if ctx.Err() != nil {
+			return
+		}
 		ents, err := os.ReadDir(abs)
 		if err != nil {
 			return
@@ -192,6 +201,9 @@ func (ix *Index) Build() {
 			abs, rel string
 		}
 		for _, e := range ents {
+			if ctx.Err() != nil {
+				return
+			}
 			name := e.Name()
 			childRel := name
 			if rel != "" {
@@ -244,6 +256,9 @@ func (ix *Index) Build() {
 		}
 
 		for _, sd := range subdirs {
+			if ctx.Err() != nil {
+				return
+			}
 			wg.Add(1)
 			select {
 			case sem <- struct{}{}:
@@ -260,12 +275,20 @@ func (ix *Index) Build() {
 	wg.Add(1)
 	walk(ix.root, "", root)
 	wg.Wait()
+	if ctx.Err() != nil {
+		return
+	}
 
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 
 	// Overlay git working-tree status onto file nodes (computed concurrently with
 	// the walk above); nil when git is unavailable or off.
-	gs := <-gsCh
+	var gs map[string]string
+	select {
+	case gs = <-gsCh:
+	case <-ctx.Done():
+		return
+	}
 
 	// Every ancestor directory of a changed file is dirty, so a collapsed folder
 	// can badge without the frontend fetching its subtree.

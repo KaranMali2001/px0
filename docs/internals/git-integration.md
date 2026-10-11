@@ -73,7 +73,7 @@ for p := rel; p != ""; {
 
 This enables the file tree in the sidebar to visually highlight collapsed directories that contain modified descendants, allowing developers to immediately spot repository changes.
 
-## 4. Diffing: One Git Call, Two Consumers, Three Views
+## 4. Diffing: Dedicated Requests and Three Views
 
 Both the line gutter and the full diff view are read off the same shell-out, `gitDiff(root, relpath)`:
 
@@ -81,7 +81,7 @@ Both the line gutter and the full diff view are read off the same shell-out, `gi
 git diff --no-color HEAD -- <path>
 ```
 
-The raw unified diff text is cached at that call site; everything downstream (line-range extraction in Go, and hunk parsing in the browser) is a pure parse of that one string, so a file is never diffed against `HEAD` more than once per request.
+`/api/file` performs no Git diff work. `/api/gutter` and `/api/diff` each fetch one diff for their own request; the tab caches gutter metadata and parsed diff hunks until reload. Scroll/refinement chunk reads therefore do not repeat full-file diffs. Commands have a ten-second context, bounded pipe waits, Unix process-group cancellation, and a 16 MiB output cap. Oversized or timed-out previews return an error rather than incomplete changes.
 
 ### Gutter Change Indicators (`/api/gutter?path=...`)
 
@@ -101,7 +101,7 @@ When viewing a file, the editor displays green, blue, and red markers in the lin
 
 The active tab gets a `Source | Diff` switch next to the tab bar (`#diff-switch`, shown only when `d.diffAvailable`) whenever the open file is modified in a git repo. `#diff-source` and `#diff-btn` each show their own view, and hovering the Diff half opens the Split/Unified menu; `Cmd/Ctrl+D` toggles the same thing, resuming whichever layout was used last (`localStorage['px0.diffLayout']`, default `split`). Diff view and the Markdown preview are mutually exclusive — entering one hides the other — and each tab remembers its own state on `d.diffMode` (`'split' | 'unified' | null`).
 
-Unlike the main code view, the diff is **not** rendered through the virtualized `#rows` viewport. A single file's diff is small (bounded by the size of that one file), so `diff.js` renders it as plain DOM into a dedicated `#diffview` overlay — the same overlay-over-`#viewport` pattern the Markdown preview uses (see [Markdown Preview](markdown.md)), just with its own content:
+Unlike the main code view, the diff is **not** rendered through the virtualized `#rows` viewport. `diff.js` renders at most 1000 unified rows or split pairs per page into a dedicated `#diffview` overlay — the same overlay-over-`#viewport` pattern the Markdown preview uses (see [Markdown Preview](markdown.md)), just with its own content:
 
 1. **Parse.** `parseDiff(text)` splits the raw diff on `@@ ... @@` hunk headers and walks each hunk's `+`/`-`/context lines once, tagging every row `add` / `del` / `ctx` and carrying its old-file and/or new-file line number. This runs once per file per session; the parsed hunks are cached on `d.diffHunks` so switching Split ↔ Unified re-renders from memory with no re-fetch.
 1. **Unified layout.** One row per parsed line: old-line column, new-line column (whichever side doesn't apply is blank), a `+`/`-` marker, and the code — a direct read of `d.diffHunks`, GitHub-"unified"-style.

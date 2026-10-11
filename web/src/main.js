@@ -51,20 +51,7 @@ initImageViewer();
 (async function boot() {
   try {
     initTheme();
-
-    // Restore word wrap (default ON)
-    const wrapPref = localStorage.getItem('px0.wrap');
-    S.wrap = wrapPref !== null ? wrapPref === 'true' : true;
-    document.body.classList.toggle('word-wrap', S.wrap);
-
-    // Line numbers are always ON
-    S.lineNumbers = true;
-    document.body.classList.remove('hide-lines');
-
-    // Restore Markdown preview (default ON)
-    const mdPref = localStorage.getItem('px0.mdPreview');
-    S.mdPreview = mdPref !== null ? mdPref === 'true' : true;
-
+    document.body.classList.add('word-wrap');
     updateEditorOptionControls();
   } catch {}
 
@@ -108,18 +95,22 @@ initImageViewer();
   // If the background indexer was still running when the UI loaded, poll briefly
   // until complete to update the total file count and index time in the status bar.
   if (S.meta && !S.meta.ready) {
-    const timer = setInterval(async () => {
+    let delay = 150;
+    const poll = async () => {
       try {
         const m = await api('/api/meta');
         if (m.ready) {
-          clearInterval(timer);
           S.meta = m;
           updateStatus();
+          return;
         }
       } catch {
-        clearInterval(timer);
+        return;
       }
-    }, 150);
+      delay = Math.min(delay * 2, 1000);
+      setTimeout(poll, delay);
+    };
+    setTimeout(poll, delay);
   }
 
   // Load harnesses and models asynchronously after the browser is loaded.

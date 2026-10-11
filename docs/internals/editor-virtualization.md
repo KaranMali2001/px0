@@ -10,7 +10,7 @@ General-purpose browser code editors (such as Monaco, CodeMirror 6, or Ace) are 
 - Their initialization latency takes hundreds of milliseconds.
 - Complex DOM representations degrade frame rates when scrolling large files.
 
-Because px0 is a code inspection and navigation tool that never edits text in place (changes go through a coding harness), it bypasses heavy third-party editor runtimes entirely. Instead, it implements a custom, high-performance virtualized surface with a fixed DOM footprint (~60 active nodes) and sub-millisecond paint budgets.
+Because px0 is a code inspection and navigation tool that never edits text in place (changes go through a coding harness), it bypasses heavy third-party editor runtimes entirely. Instead, it implements a custom, high-performance virtualized surface with a viewport-bounded row count. Actual paint time depends on browser, typography, viewport size, and source content.
 
 ## 2. DOM Surface Hierarchy
 
@@ -71,7 +71,7 @@ $$\text{first} = \max\left(0, \left\lfloor\frac{\text{scrollTop}}{\text{LH}}\rig
 $$\text{count} = \left\lceil\frac{\text{clientHeight}}{\text{LH}}\right\rceil + 2 \times \text{OVERSCAN} \quad (\text{OVERSCAN} = 24)$$
 $$\text{last} = \min(\text{totalLines}, \text{first} + \text{count})$$
 
-At standard desktop display resolutions, the total number of mounted `.row` elements is capped between 50 and 70 elements.
+Mounted `.row` count is `ceil(viewportHeight / LH) + 2 * OVERSCAN`, clipped to the document; it changes with window height.
 
 ### HTML Row Structure
 
@@ -127,7 +127,7 @@ sequenceDiagram
 
     Paint->>Paint: saveSelection()
     Note over Paint: Convert window.getSelection() into file coordinates {line, col}
-    Paint->>DOM: Replace #rows markup with recycled lines
+    Paint->>DOM: Remove outgoing rows; update changed row content
     Paint->>Walker: restoreSelection()
     Walker->>DOM: Walk Text nodes via TreeWalker in target line rows
     Walker->>DOM: window.getSelection().setBaseAndExtent(anchorNode, aOff, focusNode, fOff)
@@ -135,7 +135,7 @@ sequenceDiagram
 ```
 
 1. `saveSelection()`: Inspects `window.getSelection()`, determines the anchor and focus nodes, and maps them to file-level `{ line, col }` coordinates.
-1. DOM Update: `#rows.innerHTML` is updated with the visible window.
+1. DOM Update: Remove outgoing rows before ordering retained rows. Update row/gutter classes separately; replace `.c` HTML only when document identity, line content, or decorations change. Cursor-only changes retain text nodes.
 1. `restoreSelection()`: Uses a `TreeWalker` over the newly mounted rows to find the exact matching text offsets and calls `window.getSelection().setBaseAndExtent()`.
 
 ## 6. Decoupled Overlay Caret (`placeCaret()`)
@@ -163,9 +163,9 @@ Search match markers (`<mark>`), symbol occurrence markers (`.occ`), and definit
 ## 8. Dynamic Chunk Streaming & Whole-File Selection
 ### On-Demand Chunk Fetching (`ensureChunks`)
 
-Source lines are loaded from `/api/file` in chunks of `CHUNK = 500` lines:
+Source lines are loaded from `/api/file` in chunks of `CHUNK = 1000` lines:
 
-- As the user scrolls, `ensureChunks(d, first, last)` identifies missing 500-line blocks.
+- As the user scrolls, `ensureChunks(d, first, last)` identifies missing 1000-line blocks.
 - Asynchronous API fetches retrieve missing chunks.
 - When an inexact windowed chunk arrives (`refine: true`), `refineChunk()` automatically swaps in corrected lines once the server's background pass finishes.
 
@@ -181,3 +181,12 @@ Pressing `Ctrl+A` / `Cmd+A` outside a text input does not use the browser's nati
 ### Selection Actions
 
 Any selection, native or whole-file, drives the footer selection bar (`#footer-sel`) and the right-click menu (`#sel-menu`) in [`web/src/selbar.js`](../../web/src/selbar.js): Copy Ref, Copy with Context, Edit Inline, Find Usages, and reference copying via `Alt+C`. The viewport's `mousedown` handler only moves the caret for the primary button, so a right click on a selection neither moves the caret nor collapses the selection. See [Harness Editing & Agent Dispatch](agent-editing.md).
+
+
+## Retained Chunks, Caret, and Large Lists
+
+`chunkcache.js` stores lines sparsely instead of allocating one array entry per file line. It keeps at most 12 chunks per tab and targets 32 MiB of UTF-16 HTML across open tabs, evicting least recently used chunks. Visible chunks are protected, so a pathological visible chunk may exceed the target; row/token DOM and object overhead are outside this accounting. Missing chunks are fetched again; responses/refinement for closed or replaced tabs are ignored.
+
+Horizontal-only scroll still updates caret visibility. The ASCII/unwrapped caret calculation includes gutter width only when line numbers are visible; other text uses range geometry.
+
+Tree API/UI pages contain at most 500 siblings. Previous/Next replaces the page; reveal operations seek the target's page. Collapsing a folder releases its descendant DOM. Diff pages contain at most 1000 unified rows or split pairs, preserve line anchors/pairing, and replace the mounted page. Repeated diff synchronization retains the current DOM when document, mode, and page are unchanged.

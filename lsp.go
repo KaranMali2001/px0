@@ -105,8 +105,11 @@ type lspClient struct {
 	// (the spec default) or "utf-32".
 	encoding string
 
-	readyCh chan struct{}
-	once    sync.Once
+	readyCh  chan struct{}
+	exited   chan struct{}
+	readDone chan struct{}
+	stopOnce sync.Once
+	once     sync.Once
 
 	// indexing tracks $/progress tokens so callers can tell "no result" from
 	// "the server has not finished indexing yet".
@@ -126,7 +129,12 @@ func newLSPClient(def lspServerDef, root string) *lspClient {
 }
 
 func (c *lspClient) start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.cmd = exec.Command(c.def.Cmd[0], c.def.Cmd[1:]...)
+	setProcessGroup(c.cmd)
+	c.cmd.WaitDelay = 500 * time.Millisecond
 	c.cmd.Dir = c.root
 	c.cmd.Stderr = io.Discard
 
@@ -142,13 +150,21 @@ func (c *lspClient) start(ctx context.Context) error {
 		return err
 	}
 	c.in, c.out = stdin, bufio.NewReaderSize(stdout, 64<<10)
+	c.exited = make(chan struct{})
+	c.readDone = make(chan struct{})
 
-	go c.readLoop()
+	go func() { defer close(c.readDone); c.readLoop() }()
 	go func() {
 		c.cmd.Wait()
+		killCommand(c.cmd)
+		stdin.Close()
+		stdout.Close()
 		c.fail(fmt.Errorf("%s exited", c.def.Name))
+		close(c.exited)
 	}()
 
+	stop := context.AfterFunc(ctx, func() { killCommand(c.cmd); stdin.Close() })
+	defer stop()
 	return c.initialize(ctx)
 }
 
@@ -406,16 +422,25 @@ func (c *lspClient) initialize(ctx context.Context) error {
 }
 
 func (c *lspClient) shutdown() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	c.call(ctx, "shutdown", nil, nil)
-	c.notify("exit", nil)
-	if c.in != nil {
+	if c.cmd == nil || c.cmd.Process == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		stop := context.AfterFunc(ctx, func() { killCommand(c.cmd); c.in.Close() })
+		defer stop()
+		c.call(ctx, "shutdown", nil, nil)
+		c.notify("exit", nil)
 		c.in.Close()
-	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		time.AfterFunc(time.Second, func() { c.cmd.Process.Kill() })
-	}
+		select {
+		case <-c.exited:
+		case <-ctx.Done():
+			killCommand(c.cmd)
+			<-c.exited
+		}
+		<-c.readDone
+	})
 }
 
 // ensureOpen tells the server about a file. Most servers refuse to answer

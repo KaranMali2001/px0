@@ -128,3 +128,8 @@ To observe resident memory scavenging in real time, run:
 ```
 
 After 15 seconds of inactivity, px0 triggers `debug.FreeOSMemory()`, returning unused heap pages back to the Linux kernel and settling back to baseline.
+
+
+## Measurement scope after lifecycle/rendering changes
+
+Existing figures are historical CLI measurements, not new desktop/frame-time results. Cold open is O(source size) for exact line indexing, with byte-bounded lexing; warm opens reuse the cache. Source offsets now use 32 bits, browser HTML uses a 32 MiB target/12 chunks per tab, and trees/diffs use pages. Backend cache accounting excludes in-flight work and native/child allocations. The macOS status bar now samples OS RSS and process CPU; compare total application usage by measuring WebKit/LSP/harness children separately. No new benchmark numbers are implied by these implementation changes.

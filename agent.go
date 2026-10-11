@@ -423,6 +423,8 @@ type agentManager struct {
 	models   map[string]string // harness name -> selected model
 	jobs     map[int64]*agentJob
 	seq      int64
+	closed   bool
+	runs     sync.WaitGroup
 }
 
 // newAgentManager wires discovery and restores the remembered choice. A flag
@@ -732,6 +734,10 @@ func (m *agentManager) Start(abs, rel string, l1, l2 int, instruction string, fo
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, context.Canceled
+	}
 	if m.args == nil {
 		m.mu.Unlock()
 		uiStatus("err", "agent", "edit dispatch refused: no coding harness selected", 0, os.Stdout)
@@ -744,6 +750,7 @@ func (m *agentManager) Start(abs, rel string, l1, l2 int, instruction string, fo
 	}
 	args := m.args
 	name := m.selected
+	model := m.models[name]
 	m.mu.Unlock()
 
 	snippet, err := readLineRange(abs, l1, l2)
@@ -751,10 +758,15 @@ func (m *agentManager) Start(abs, rel string, l1, l2 int, instruction string, fo
 		uiStatus("err", "agent", fmt.Sprintf("failed reading snippet for %s:%s: %s", rel, lineRef(l1, l2), err.Error()), 0, os.Stdout)
 		return nil, err
 	}
+	tracked := gitAvailable(m.root)
 
 	m.mu.Lock()
 	// Re-check under lock: another dispatch may have raced between the check
 	// above and here, while this one was reading the file and git status.
+	if m.closed {
+		m.mu.Unlock()
+		return nil, context.Canceled
+	}
 	if m.overlapLocked(rel, l1, l2) {
 		m.mu.Unlock()
 		uiStatus("warn", "agent", "edit dispatch refused: overlapping edit already running", 0, os.Stdout)
@@ -769,7 +781,7 @@ func (m *agentManager) Start(abs, rel string, l1, l2 int, instruction string, fo
 		Lines:   lineRef(l1, l2),
 		Running: true,
 		Changed: []string{},
-		Tracked: gitAvailable(m.root),
+		Tracked: tracked,
 		l1:      l1,
 		l2:      l2,
 		out:     &tailBuffer{max: agentLogBytes},
@@ -781,11 +793,12 @@ func (m *agentManager) Start(abs, rel string, l1, l2 int, instruction string, fo
 		m.jobs = map[int64]*agentJob{}
 	}
 	m.jobs[job.ID] = job
+	m.runs.Add(1)
 	m.mu.Unlock()
 
 	modelStr := ""
-	if m.models != nil && m.models[name] != "" {
-		modelStr = fmt.Sprintf(" (%s)", m.models[name])
+	if model != "" {
+		modelStr = fmt.Sprintf(" (%s)", model)
 	}
 	uiStatus("step", "agent", fmt.Sprintf("#%d %s%s · %s:%s  %q", job.ID, name, modelStr, rel, lineRef(l1, l2), instruction), 0, os.Stdout)
 	go m.run(ctx, cancel, job, args, agentPrompt(rel, l1, l2, snippet, instruction))
@@ -793,13 +806,14 @@ func (m *agentManager) Start(abs, rel string, l1, l2 int, instruction string, fo
 }
 
 func (m *agentManager) run(ctx context.Context, cancel context.CancelFunc, job *agentJob, template []string, prompt string) {
+	defer m.runs.Done()
 	defer cancel()
 
 	if uiVerbose {
 		uiVerbosePrompt(job.ID, job.Harness, prompt, os.Stdout)
 	}
 
-	before := worktreeSnapshot(m.root)
+	before := worktreeSnapshotContext(ctx, m.root)
 
 	args := make([]string, len(template))
 	for i, tok := range template {
@@ -810,6 +824,9 @@ func (m *agentManager) run(ctx context.Context, cancel context.CancelFunc, job *
 	stderrStreamer := newLineStreamer(job.stderr, uiDim("│", os.Stdout), os.Stdout)
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error { return killCommand(cmd) }
+	cmd.WaitDelay = 500 * time.Millisecond
 	cmd.Dir = m.root
 	cmd.Stdout = stdoutStreamer
 	cmd.Stderr = stderrStreamer
@@ -817,13 +834,21 @@ func (m *agentManager) run(ctx context.Context, cancel context.CancelFunc, job *
 	// fast instead of hanging until the timeout with nothing on screen.
 
 	err := cmd.Run()
+	if cmd.Process != nil {
+		killCommand(cmd)
+	}
 	stdoutStreamer.Flush()
 	stderrStreamer.Flush()
-	if ctx.Err() != nil {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		err = ctx.Err()
+	} else if ctx.Err() != nil {
 		err = fmt.Errorf("gave up after %s", agentTimeout)
 	}
 
-	changed := changedSince(m.root, before)
+	changed := changedSinceMaps(before, worktreeSnapshotContext(ctx, m.root))
+	if ctx.Err() != nil {
+		changed = nil
+	}
 	m.settle(changed)
 
 	m.mu.Lock()
@@ -916,7 +941,16 @@ func (m *agentManager) CancelJob(id int64) bool {
 	return cancelled
 }
 
-func (m *agentManager) Close() { m.Cancel() }
+func (m *agentManager) Close() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	m.Cancel()
+	m.runs.Wait()
+}
 
 // changedSince reports the paths whose state differs from the snapshot taken
 // before the run. Asking git is the only honest answer to "what did it touch":
@@ -930,7 +964,11 @@ func changedSince(root string, before map[string]string) []string {
 // already modified: it reads "M" before and after, so the edit would go unseen.
 // Files git lists as clean are left out, and those still surface through status.
 func worktreeSnapshot(root string) map[string]string {
-	st := gitStatus(root)
+	return worktreeSnapshotContext(context.Background(), root)
+}
+
+func worktreeSnapshotContext(ctx context.Context, root string) map[string]string {
+	st := gitStatusContext(ctx, root)
 	for rel, code := range st {
 		if fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err == nil {
 			st[rel] = code + " " + strconv.FormatInt(fi.Size(), 10) + " " + strconv.FormatInt(fi.ModTime().UnixNano(), 10)

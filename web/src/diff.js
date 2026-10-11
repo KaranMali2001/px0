@@ -2,9 +2,7 @@
 // Git diff view for the active tab: renders the file's unified diff against
 // HEAD in a dedicated overlay (like the Markdown preview), in either a
 // side-by-side split layout (default) or a single-column unified layout.
-// Unlike the code viewport this is not virtualized -- a file's own diff is
-// bounded in size, so a plain DOM render is simple and fast enough.
-import { $, S, doc_, esc, api } from './state.js';
+import { $, S, doc_, esc, api, persistPreference } from './state.js';
 import { syncPreview } from './markdown.js';
 import { setStatusNote, updateStatus } from './status.js';
 
@@ -16,12 +14,15 @@ let shown = null; // doc the diff view is currently showing, null while hidden
 // d.diffMode is 'split' | 'unified' | null (off), per tab. The layout last
 // picked (split vs unified) is remembered globally as the default for the
 // next file entering diff view.
-export function setLayoutPref(mode) {
-  try { localStorage.setItem('px0.diffLayout', mode); } catch {}
+export function setLayoutPref(mode, persist = true) {
+  const split = mode !== 'unified';
+  if (!S.settings) S.settings = {};
+  S.settings['diffEditor.renderSideBySide'] = split;
+  if (persist) persistPreference('diffEditor.renderSideBySide', split).catch(() => {});
 }
 
 export function layoutPref() {
-  try { return localStorage.getItem('px0.diffLayout') || 'split'; } catch { return 'split'; }
+  return S.settings?.['diffEditor.renderSideBySide'] === false ? 'unified' : 'split';
 }
 
 function diffMode(d = doc_()) {
@@ -39,7 +40,7 @@ export function syncDiffView() {
     shown = want;
     diffview.hidden = !want;
     if (want) drawDiff(want);
-    else diffContent.replaceChildren();
+    else { diffContent.replaceChildren(); diffContent._doc = null; }
   } else if (want && want.diffHunks !== undefined) {
     renderDiff(want);
   }
@@ -81,8 +82,8 @@ async function drawDiff(d) {
     try {
       d.diffReq = d.diffReq || api('/api/diff', { path: d.path });
       const j = await d.diffReq;
-      d.diffText = j.diff || '';
-      d.diffHunks = parseDiff(d.diffText);
+      d.diffHunks = parseDiff(j.diff || '');
+      d.diffText = '';
     } catch (e) {
       d.diffText = '';
       d.diffHunks = [];
@@ -100,6 +101,17 @@ async function drawDiff(d) {
 }
 
 function renderDiff(d) {
+  if (d.diffHunks?.length) {
+    const total = d.diffHunks.reduce((n, hunk) => {
+      if (d.diffMode === 'split') hunk.pairs ||= pairRows(hunk.rows);
+      return n + (d.diffMode === 'split' ? hunk.pairs.length : hunk.rows.length);
+    }, 0);
+    d.diffPage = Math.min(d.diffPage || 0, Math.floor(Math.max(0, total - 1) / 1000));
+  }
+  const key = d.diffMode + ':' + (d.diffPage || 0);
+  if (diffContent._doc === d && diffContent._key === key) { syncDiffAgentTargets(); return; }
+  diffContent._doc = d;
+  diffContent._key = key;
   diffContent.replaceChildren();
   if (!d.diffHunks || !d.diffHunks.length) {
     const p = document.createElement('div');
@@ -109,9 +121,34 @@ function renderDiff(d) {
     return;
   }
   const frag = document.createDocumentFragment();
+  const pageSize = 1000;
+  const total = d.diffHunks.reduce((n, hunk) => {
+    if (d.diffMode === 'split') hunk.pairs ||= pairRows(hunk.rows);
+    return n + (d.diffMode === 'split' ? hunk.pairs.length : hunk.rows.length);
+  }, 0);
+  const start = (d.diffPage || 0) * pageSize;
+  let offset = 0;
   for (const hunk of d.diffHunks) {
+    const data = d.diffMode === 'split' ? hunk.pairs : hunk.rows;
+    const from = Math.max(0, start - offset);
+    const to = Math.min(data.length, start + pageSize - offset);
+    offset += data.length;
+    if (from >= to) continue;
     frag.append(hunkHeader(hunk));
-    frag.append(d.diffMode === 'unified' ? unifiedTable(hunk) : splitTable(hunk));
+    frag.append(d.diffMode === 'unified' ? unifiedTable(hunk, data.slice(from, to)) : splitTable(hunk, data.slice(from, to)));
+  }
+  if (total > pageSize) {
+    const nav = document.createElement('div');
+    nav.className = 'diff-page';
+    for (const [label, page] of [['Previous', (d.diffPage || 0) - 1], ['Next', (d.diffPage || 0) + 1]]) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.disabled = page < 0 || page * pageSize >= total;
+      button.addEventListener('click', () => { d.diffPage = page; renderDiff(d); diffview.scrollTop = 0; });
+      nav.append(button);
+    }
+    nav.append(document.createTextNode(' ' + (start + 1) + '–' + Math.min(total, start + pageSize) + ' of ' + total));
+    frag.prepend(nav);
   }
   diffContent.append(frag);
   syncDiffAgentTargets();
@@ -169,10 +206,10 @@ function parseDiff(text) {
 
 /* ---------- unified layout: one row per diff line ---------- */
 
-function unifiedTable(hunk) {
+function unifiedTable(hunk, rows = hunk.rows) {
   const table = document.createElement('div');
   table.className = 'diff-table diff-unified';
-  for (const row of hunk.rows) {
+  for (const row of rows) {
     const r = document.createElement('div');
     r.className = 'diff-row diff-' + row.type;
     anchor(r, row);
@@ -189,10 +226,10 @@ function unifiedTable(hunk) {
 
 /* ---------- split layout: deletions and additions paired side by side ---------- */
 
-function splitTable(hunk) {
+function splitTable(hunk, pairs = pairRows(hunk.rows)) {
   const table = document.createElement('div');
   table.className = 'diff-table diff-split';
-  for (const pair of pairRows(hunk.rows)) {
+  for (const pair of pairs) {
     const r = document.createElement('div');
     r.className = 'diff-row-pair';
     r.append(splitSide(pair.left, 'left'), splitSide(pair.right, 'right'));

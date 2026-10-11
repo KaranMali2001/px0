@@ -9,13 +9,32 @@
       if (v !== undefined && v !== "")
         u.searchParams.set(k, v);
     const r = await fetch(u, { method, ...opts });
-    const j = await r.json();
-    if (j.error)
-      throw Object.assign(new Error(j.error), { body: j });
+    let j;
+    try {
+      j = await r.json();
+    } catch {
+      throw new Error(`${method} ${path} failed (${r.status})`);
+    }
+    if (!r.ok || j.error)
+      throw Object.assign(new Error(j.error || `${method} ${path} failed (${r.status})`), { body: j });
     return j;
   };
   var api = (path, params, opts) => request("GET", path, params, opts);
   var apiPost = (path, params, opts) => request("POST", path, params, opts);
+  var apiPostJSON = (path, body, opts = {}) => request("POST", path, null, {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...opts.headers || {} },
+    body: JSON.stringify(body)
+  });
+  async function persistPreference(key, value) {
+    const res = await apiPostJSON("/api/settings", { [key]: value });
+    if (res.settings) {
+      if (!S2.settings)
+        S2.settings = {};
+      Object.assign(S2.settings, res.settings);
+    }
+    return res;
+  }
   var debounce = (fn, ms) => {
     let t;
     return (...a) => {
@@ -131,6 +150,52 @@
     }
   }
 
+  // web/src/chunkcache.js
+  var MAX_BYTES = 32 * 1024 * 1024;
+  var MAX_CHUNKS = 12;
+  var clock = 0;
+  function touchChunk(d, c) {
+    const entry = d.chunkCache?.get(c);
+    if (entry)
+      entry.used = ++clock;
+  }
+  function storeChunk(d, j) {
+    d.chunkCache ||= new Map;
+    const c = Math.floor(j.start / CHUNK);
+    for (let i = 0;i < j.lines.length; i++)
+      d.lines[j.start + i] = j.lines[i];
+    d.chunks.add(c);
+    d.chunkCache.set(c, {
+      start: j.start,
+      count: j.lines.length,
+      bytes: j.lines.reduce((n, line) => n + line.length * 2, 0),
+      used: ++clock
+    });
+    const active = doc_();
+    const first = Math.max(0, Math.floor(vp.scrollTop / LH2) - OVERSCAN);
+    const last = first + Math.ceil(vp.clientHeight / LH2) + OVERSCAN * 2;
+    const candidates = [];
+    let bytes = 0;
+    for (const tab of S2.tabs) {
+      for (const [chunk, entry] of tab.chunkCache || []) {
+        bytes += entry.bytes;
+        if (tab === active && entry.start < last && entry.start + entry.count > first)
+          continue;
+        candidates.push({ tab, chunk, entry });
+      }
+    }
+    candidates.sort((a, b) => a.entry.used - b.entry.used);
+    for (const { tab, chunk, entry } of candidates) {
+      if (bytes <= MAX_BYTES && tab.chunkCache.size <= MAX_CHUNKS)
+        continue;
+      for (let i = 0;i < entry.count; i++)
+        delete tab.lines[entry.start + i];
+      tab.chunks.delete(chunk);
+      tab.chunkCache.delete(chunk);
+      bytes -= entry.bytes;
+    }
+  }
+
   // web/src/renderer.js
   function measure() {
     const m = $("#measure");
@@ -143,18 +208,17 @@
       return;
     const digits = String(d.total).length;
     editor.style.setProperty("--gw", digits);
-    const gutter = digits * S2.chW + 30;
+    const gutter = S2.lineNumbers ? digits * S2.chW + 30 : 0;
     const w = S2.wrap ? vp.clientWidth : Math.max(vp.clientWidth, gutter + (d.maxCols + 4) * S2.chW);
     sizer.style.height = d.total * LH2 + Math.max(120, vp.clientHeight * 0.5) + "px";
     sizer.style.width = w + "px";
     rowsEl.style.width = w + "px";
   }
-  function toggleWordWrap(forced) {
+  function toggleWordWrap(forced, persist = forced === undefined) {
     S2.wrap = typeof forced === "boolean" ? forced : !S2.wrap;
     document.body.classList.toggle("word-wrap", S2.wrap);
-    try {
-      localStorage.setItem("px0.wrap", S2.wrap ? "true" : "false");
-    } catch {}
+    if (persist)
+      persistPreference("editor.wordWrap", S2.wrap ? "on" : "off").catch(() => {});
     updateEditorOptionControls();
     layout();
     render();
@@ -187,17 +251,23 @@
       wrapBtn.classList.toggle("active", !!S2.wrap);
   }
   var raf = 0;
-  function render() {
+  var lastViewport = "";
+  var lastDoc = null;
+  var forceRender = false;
+  function render(force = true) {
+    forceRender ||= force;
     if (raf)
       return;
     raf = requestAnimationFrame(() => {
       raf = 0;
-      paint();
+      paint(forceRender);
+      forceRender = false;
     });
   }
-  function paint() {
+  function paint(force = true) {
     const d = doc_();
     if (!d) {
+      lastDoc = null;
       const c = $("#caret");
       if (c)
         c.hidden = true;
@@ -207,10 +277,20 @@
     const first = Math.max(0, Math.floor(top / LH2) - OVERSCAN);
     const count = Math.ceil(vp.clientHeight / LH2) + OVERSCAN * 2;
     const last = Math.min(d.total, first + count);
+    const viewport = d.path + ":" + first + ":" + last;
+    if (!force && d === lastDoc && viewport === lastViewport) {
+      placeCaret();
+      return;
+    }
     ensureChunks(d, first, last);
-    let html = "";
+    const sel = saveSelection();
     const gut = d.gutter || null;
     const agentRanges = (S2.agentTargets || []).filter((t) => t.path === d.path);
+    const live = new Map([...rowsEl.children].map((row) => [+row.dataset.l, row]));
+    for (const row of live.values()) {
+      if (+row.dataset.l <= first || +row.dataset.l > last)
+        row.remove();
+    }
     for (let i = first;i < last; i++) {
       const n = i + 1;
       const body = d.lines[i];
@@ -226,16 +306,41 @@
         if (gut.dels.has(n))
           rc += " gut-del";
       }
-      html += '<div class="' + rc + '" data-l="' + n + '">' + '<div class="' + gc + '">' + n + '</div><div class="c">' + (body === undefined ? "" : body) + "</div></div>";
+      let row = live.get(n);
+      if (!row) {
+        row = document.createElement("div");
+        row.dataset.l = n;
+        row.innerHTML = '<div class="g">' + n + '</div><div class="c"></div>';
+      }
+      row.className = rc;
+      row.firstElementChild.className = gc;
+      const activeHit = S2.find?.hits[S2.find.active];
+      const decoration = JSON.stringify([
+        S2.occ,
+        S2.link?.line === n ? S2.link : null,
+        S2.find?.byLine.has(n) ? S2.find.q : null,
+        S2.find?.ci,
+        activeHit?.line === n ? activeHit.n : null
+      ]);
+      if (row._doc !== d || row._body !== body || row._decoration !== decoration) {
+        row.lastElementChild.innerHTML = body === undefined ? "" : body;
+        row._doc = d;
+        row._body = body;
+        row._decoration = decoration;
+        delete row.dataset.decorated;
+      }
+      const at = rowsEl.children[i - first];
+      if (at !== row)
+        rowsEl.insertBefore(row, at || null);
     }
-    const sel = saveSelection();
     rowsEl.style.transform = "translateY(" + first * LH2 + "px)";
-    rowsEl.innerHTML = html;
     rowsEl.classList.toggle("all", S2.selAll === d);
-    decorate(first, last);
+    decorate(first, last, false);
     if (sel)
       restoreSelection(sel);
     placeCaret();
+    lastViewport = viewport;
+    lastDoc = d;
   }
   var caretKey = "";
   function placeCaret() {
@@ -250,27 +355,38 @@
     }
     const code = $(".c", row);
     const col = Math.max(0, Math.min(d.col || 0, code.textContent.length));
-    const [node, off] = toPoint({ line: d.cur, col });
-    const base = sizer.getBoundingClientRect();
     let x, y;
-    if (node.nodeType === 3) {
-      const r = document.createRange();
-      r.setStart(node, off);
-      r.collapse(true);
-      const rect = r.getClientRects()[0] || r.getBoundingClientRect();
-      x = rect.left;
-      y = S2.wrap ? rect.top - (LH2 - rect.height) / 2 : row.getBoundingClientRect().top;
+    const text = code.textContent;
+    const gutter = S2.lineNumbers ? String(d.total).length * S2.chW + 30 : 0;
+    if (!S2.wrap && !/[\t\x80-\uffff]/.test(text)) {
+      x = gutter + col * S2.chW;
+      y = (d.cur - 1) * LH2;
+      if (x < vp.scrollLeft + gutter - 1) {
+        el.hidden = true;
+        return null;
+      }
     } else {
-      const cr = code.getBoundingClientRect();
-      x = cr.left + parseFloat(getComputedStyle(code).paddingLeft || "0");
-      y = cr.top;
+      const [node, off] = toPoint({ line: d.cur, col });
+      const base = sizer.getBoundingClientRect();
+      if (node.nodeType === 3) {
+        const r = document.createRange();
+        r.setStart(node, off);
+        r.collapse(true);
+        const rect = r.getClientRects()[0] || r.getBoundingClientRect();
+        x = rect.left - base.left;
+        y = S2.wrap ? rect.top - base.top - (LH2 - rect.height) / 2 : row.getBoundingClientRect().top - base.top;
+      } else {
+        const cr = code.getBoundingClientRect();
+        x = cr.left - base.left + parseFloat(getComputedStyle(code).paddingLeft || "0");
+        y = cr.top - base.top;
+      }
+      const g = $(".g", row);
+      if (g && x + base.left < g.getBoundingClientRect().right - 1) {
+        el.hidden = true;
+        return null;
+      }
     }
-    const g = $(".g", row);
-    if (g && x < g.getBoundingClientRect().right - 1) {
-      el.hidden = true;
-      return null;
-    }
-    el.style.transform = "translate(" + (x - base.left) + "px," + (y - base.top) + "px)";
+    el.style.transform = "translate(" + x + "px," + y + "px)";
     el.hidden = false;
     const key = d.path + ":" + d.cur + ":" + col;
     if (key !== caretKey) {
@@ -279,7 +395,7 @@
       el.offsetWidth;
       el.classList.add("blink");
     }
-    return x - base.left;
+    return x;
   }
   function saveSelection() {
     const sel = window.getSelection();
@@ -334,21 +450,22 @@
     }
     return [code, code.childNodes.length];
   }
-  function decorate(first, last) {
+  function decorate(first, last, force = true) {
     const d = doc_();
+    const rows = force ? rowsEl.children : [...rowsEl.children].filter((row) => !row.dataset.decorated);
     if (S2.occ) {
-      for (const row of rowsEl.children)
+      for (const row of rows)
         markNodes($(".c", row), S2.occ, true, "occ");
     }
     if (S2.link) {
       const row = rowFor(S2.link.line);
-      if (row)
+      if (row && (force || !row.dataset.decorated))
         wrapRange($(".c", row), S2.link.col, S2.link.col + S2.link.word.length, "link");
     }
     if (S2.find && S2.find.hits.length) {
       const byLine = S2.find.byLine;
       const act = S2.find.hits[S2.find.active];
-      for (const row of rowsEl.children) {
+      for (const row of rows) {
         const n = +row.dataset.l;
         if (!byLine.has(n))
           continue;
@@ -357,6 +474,8 @@
           marks[act.n].classList.add("on");
       }
     }
+    for (const row of rows)
+      row.dataset.decorated = "1";
   }
   function markNodes(el, needle, caseSensitive, cls) {
     if (!el || !needle)
@@ -432,16 +551,15 @@
   function ensureChunks(d, first, last) {
     const c0 = Math.floor(first / CHUNK), c1 = Math.floor(Math.max(first, last - 1) / CHUNK);
     for (let c = c0;c <= c1; c++) {
+      touchChunk(d, c);
       if (d.chunks.has(c) || d.pending.has(c))
         continue;
       d.pending.add(c);
       const gen = d.gen;
       api("/api/file", { path: d.path, start: c * CHUNK, count: CHUNK }).then((j) => {
-        if (gen !== d.gen)
+        if (gen !== d.gen || !S2.tabs.includes(d))
           return;
-        for (let i = 0;i < j.lines.length; i++)
-          d.lines[j.start + i] = j.lines[i];
-        d.chunks.add(c);
+        storeChunk(d, j);
         d.pending.delete(c);
         if (doc_() === d)
           render();
@@ -451,13 +569,14 @@
     }
   }
   function refineChunk(d, c, delay = 800, tries = 0) {
+    const gen = d.gen;
     if (tries === 0) {
       if (d.refining.has(c))
         return;
       d.refining.add(c);
     }
     setTimeout(async () => {
-      if (!S2.tabs.includes(d) || tries > 6) {
+      if (!S2.tabs.includes(d) || !d.chunks.has(c) || tries > 6) {
         d.refining.delete(c);
         return;
       }
@@ -468,7 +587,7 @@
         d.refining.delete(c);
         return;
       }
-      if (!S2.tabs.includes(d)) {
+      if (!S2.tabs.includes(d) || !d.chunks.has(c) || gen !== d.gen) {
         d.refining.delete(c);
         return;
       }
@@ -479,17 +598,16 @@
       d.refining.delete(c);
       let changed = false;
       for (let i = 0;i < j.lines.length; i++) {
-        if (d.lines[j.start + i] !== j.lines[i]) {
-          d.lines[j.start + i] = j.lines[i];
+        if (d.lines[j.start + i] !== j.lines[i])
           changed = true;
-        }
       }
+      storeChunk(d, j);
       if (changed && doc_() === d)
         render();
     }, delay);
   }
   function initRenderer() {
-    vp.addEventListener("scroll", render, { passive: true });
+    vp.addEventListener("scroll", () => render(false), { passive: true });
     new ResizeObserver(() => {
       layout();
       render();
@@ -649,26 +767,44 @@
     C: ["git-A", "copied"],
     "!": ["git-M", "unmerged"]
   };
-  async function drawTree(dir, container, depth) {
+  async function drawTree(dir, container, depth, offset = 0, seek = "") {
+    const request2 = {};
+    container._treeRequest = request2;
     let j;
     try {
-      j = await api("/api/tree", { dir });
+      j = await api("/api/tree", { dir, offset, seek });
     } catch {
       return;
     }
+    if (container._treeRequest !== request2)
+      return;
+    container.dataset.loaded = "1";
     container.innerHTML = j.children.map((c) => {
       const pad = 8 + depth * 12;
       const ig = c.ignored ? " ignored" : "";
       const note = c.ignored ? " (ignored by .gitignore, not searched)" : "";
       if (c.dir) {
         const dc = c.dirty ? " dirty" : "";
-        return '<div class="tw"><div class="tr dir' + ig + dc + '" data-dir="' + esc2(c.path) + '" style="padding-left:' + pad + 'px" title="Folder: ' + esc2(c.path) + note + '">' + '<span class="ar"></span><span class="nm">' + esc2(c.name) + "</span></div>" + '<div class="kids" data-kids="' + esc2(c.path) + '"></div></div>';
+        return '<div class="tw"><div class="tr dir' + ig + dc + '" data-dir="' + esc2(c.path) + '" style="padding-left:' + pad + 'px" title="Folder: ' + esc2(c.path) + note + '">' + '<span class="ar"></span>' + icon("folder") + '<span class="nm">' + esc2(c.name) + "</span></div>" + '<div class="kids" data-kids="' + esc2(c.path) + '"></div></div>';
       }
       const g = GIT_STATUS[c.status];
       const gc = g ? " dirty " + g[0] : "";
       const badge = g ? '<span class="gs" title="git: ' + g[1] + '">' + esc2(c.status) + "</span>" : "";
-      return '<div class="tr file' + ig + gc + '" data-file="' + esc2(c.path) + '" style="padding-left:' + (pad + 12) + 'px" title="Open ' + esc2(c.path) + note + '">' + '<span class="ic" data-t="' + fileKind(c.name) + '"></span><span class="nm">' + esc2(c.name) + "</span>" + badge + "</div>";
+      return '<div class="tr file' + ig + gc + '" data-file="' + esc2(c.path) + '" style="padding-left:' + (pad + 12) + 'px" title="Open ' + esc2(c.path) + note + '">' + icon(fileKind(c.name)) + '<span class="nm">' + esc2(c.name) + "</span>" + badge + "</div>";
     }).join("");
+    if (j.total > j.pageSize) {
+      const nav = document.createElement("div");
+      nav.className = "tree-page";
+      for (const [label, page] of [["Previous", j.offset - j.pageSize], ["Next", j.offset + j.pageSize]]) {
+        const button = document.createElement("button");
+        button.textContent = label;
+        button.disabled = page < 0 || page >= j.total;
+        button.addEventListener("click", () => drawTree(dir, container, depth, page));
+        nav.append(button);
+      }
+      nav.append(document.createTextNode(" " + (j.offset + 1) + "–" + (j.offset + j.children.length) + " of " + j.total));
+      container.prepend(nav);
+    }
   }
   var FILE_KIND = {
     go: "code",
@@ -731,20 +867,62 @@
     ico: "img",
     avif: "img"
   };
+  var SPECIAL_KIND = {
+    "package.json": "package",
+    "package-lock.json": "lock",
+    "pnpm-lock.yaml": "lock",
+    "yarn.lock": "lock",
+    dockerfile: "container",
+    "compose.yml": "container",
+    "docker-compose.yml": "container",
+    readme: "doc",
+    "readme.md": "doc",
+    ".gitignore": "config",
+    ".gitattributes": "config",
+    ".env": "config",
+    makefile: "code"
+  };
+  var ICON_PATH = {
+    folder: '<path d="M1.8 4.5h4l1.5 1.7h6.9v6.7a1.2 1.2 0 0 1-1.2 1.2H3a1.2 1.2 0 0 1-1.2-1.2z"/><path d="M1.8 6.2h12.4"/>',
+    code: '<path d="m5.8 4.2-3 3.8 3 3.8M10.2 4.2l3 3.8-3 3.8"/>',
+    data: '<ellipse cx="8" cy="3.7" rx="4.6" ry="2"/><path d="M3.4 3.7v4.1c0 1.1 2.1 2 4.6 2s4.6-.9 4.6-2V3.7M3.4 7.8v4.1c0 1.1 2.1 2 4.6 2s4.6-.9 4.6-2V7.8"/>',
+    doc: '<path d="M4 1.8h5l3 3v9.4H4z"/><path d="M9 1.8v3h3M5.8 8h4.6M5.8 10.4h4.6"/>',
+    web: '<circle cx="8" cy="8" r="5.7"/><path d="M2.3 8h11.4M8 2.3c1.4 1.5 2.1 3.4 2.1 5.7S9.4 12.2 8 13.7M8 2.3C6.6 3.8 5.9 5.7 5.9 8s.7 4.2 2.1 5.7"/>',
+    img: '<rect x="2" y="2.4" width="12" height="11.2" rx="1.4"/><circle cx="5.5" cy="5.6" r="1"/><path d="m3.3 11 3.3-3.1 2.2 2 1.7-1.5 2.2 2.6"/>',
+    package: '<path d="m8 1.8 5 2.8v6.8l-5 2.8-5-2.8V4.6z"/><path d="m3 4.6 5 2.8 5-2.8M8 7.4v6.8"/>',
+    lock: '<rect x="3.1" y="7" width="9.8" height="6.2" rx="1.3"/><path d="M5.2 7V5.2a2.8 2.8 0 0 1 5.6 0V7M8 9.4v1.5"/>',
+    config: '<path d="M3 4h10M3 8h10M3 12h10"/><circle cx="5.5" cy="4" r="1.2"/><circle cx="10.5" cy="8" r="1.2"/><circle cx="7.5" cy="12" r="1.2"/>',
+    container: '<rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 6h2M9 6h2M5 9h2M9 9h2"/>',
+    other: '<path d="M4 1.8h5l3 3v9.4H4z"/><path d="M9 1.8v3h3"/>'
+  };
+  function icon(kind) {
+    return '<svg class="ic" data-t="' + kind + '" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">' + (ICON_PATH[kind] || ICON_PATH.other) + "</svg>";
+  }
   function fileKind(name) {
+    const special = SPECIAL_KIND[name.toLowerCase()];
+    if (special)
+      return special;
     const i = name.lastIndexOf(".");
     return i > 0 && FILE_KIND[name.slice(i + 1).toLowerCase()] || "other";
   }
   async function revealDir(dir) {
     const parts = dir.split("/");
+    let container = treeEl;
     for (let i = 0;i < parts.length; i++) {
       const p = parts.slice(0, i + 1).join("/");
-      const row = treeEl.querySelector('[data-dir="' + CSS.escape(p) + '"]');
+      let row = container.querySelector('[data-dir="' + CSS.escape(p) + '"]');
+      if (!row) {
+        await drawTree(parts.slice(0, i).join("/"), container, i, 0, p);
+        row = container.querySelector('[data-dir="' + CSS.escape(p) + '"]');
+      }
       if (!row)
         break;
-      if (!row.classList.contains("open"))
-        row.click();
-      await new Promise((r) => setTimeout(r, 30));
+      row.classList.add("open");
+      container = row.nextElementSibling;
+      container.classList.add("open");
+      openDirs.add(p);
+      if (!container.dataset.loaded)
+        await drawTree(p, container, i + 1);
     }
     const last = treeEl.querySelector('[data-dir="' + CSS.escape(dir) + '"]');
     if (last)
@@ -754,7 +932,14 @@
     const idx = path.lastIndexOf("/");
     if (idx > 0)
       await revealDir(path.slice(0, idx));
-    const row = treeEl.querySelector('[data-file="' + CSS.escape(path) + '"]');
+    let row = treeEl.querySelector('[data-file="' + CSS.escape(path) + '"]');
+    if (!row) {
+      const dir = idx > 0 ? path.slice(0, idx) : "";
+      const container = dir ? treeEl.querySelector('[data-kids="' + CSS.escape(dir) + '"]') : treeEl;
+      if (container)
+        await drawTree(dir, container, dir ? dir.split("/").length : 0, 0, path);
+      row = treeEl.querySelector('[data-file="' + CSS.escape(path) + '"]');
+    }
     if (row) {
       $$(".tr.sel", treeEl).forEach((x) => x.classList.remove("sel"));
       row.classList.add("sel");
@@ -776,27 +961,54 @@
         if (open) {
           openDirs.add(path);
           if (!kids.dataset.loaded) {
-            kids.dataset.loaded = "1";
             await drawTree(path, kids, path.split("/").length);
           }
-        } else
+        } else {
           openDirs.delete(path);
+          kids._treeRequest = null;
+          kids.replaceChildren();
+          delete kids.dataset.loaded;
+        }
         return;
       }
       const f = e.target.closest("[data-file]");
       if (f) {
+        f.classList.add("loading");
+        const opened = await openFile(f.dataset.file);
+        f.classList.remove("loading");
+        if (!opened)
+          return;
         $$(".tr.sel", treeEl).forEach((x) => x.classList.remove("sel"));
         f.classList.add("sel");
-        openFile(f.dataset.file);
       }
     });
   }
 
   // web/src/panels.js
   function showPanel(name) {
-    document.body.classList.remove("side-hidden");
+    setSidebarVisible(true);
+  }
+  function setSidebarLocation(location2) {
+    document.body.classList.toggle("side-right", location2 === "right");
     layout();
     render();
+  }
+  function setSidebarVisible(visible, persist = false) {
+    document.body.classList.toggle("side-hidden", !visible);
+    if (persist)
+      persistPreference("workbench.sideBar.visible", visible).catch(() => {});
+    layout();
+    render();
+  }
+  function toggleSidebar() {
+    setSidebarVisible(document.body.classList.contains("side-hidden"), true);
+  }
+  function setSidebarWidth(width, persist = false) {
+    const schema = S2.settingsSchema?.find((item) => item.key === "workbench.sideBar.width");
+    const next = Math.max(schema?.min ?? 170, Math.min(schema?.max ?? 620, Math.round(width)));
+    $("#side").style.width = next + "px";
+    if (persist)
+      persistPreference("workbench.sideBar.width", next).catch(() => {});
   }
   function initPanels() {
     $("#btn-reindex").addEventListener("click", async () => {
@@ -821,15 +1033,16 @@
       addEventListener("mousemove", (e) => {
         if (!dragging)
           return;
-        $("#side").style.width = Math.max(170, Math.min(620, e.clientX)) + "px";
+        setSidebarWidth(document.body.classList.contains("side-right") ? window.innerWidth - e.clientX : e.clientX);
       });
       addEventListener("mouseup", () => {
-        if (dragging) {
-          dragging = false;
-          rz.classList.remove("drag");
-          layout();
-          render();
-        }
+        if (!dragging)
+          return;
+        dragging = false;
+        rz.classList.remove("drag");
+        setSidebarWidth(parseFloat($("#side").style.width), true);
+        layout();
+        render();
       });
     })();
   }
@@ -2265,11 +2478,10 @@
     render();
     updateStatus();
   }
-  function mdSetPref(on) {
+  function mdSetPref(on, persist = true) {
     S2.mdPreview = on;
-    try {
-      localStorage.setItem("px0.mdPreview", on ? "true" : "false");
-    } catch {}
+    if (persist)
+      persistPreference("markdown.preview.open", on).catch(() => {});
   }
   var HTML_NS = "http://www.w3.org/1999/xhtml";
   var MD_DROP = new Set(("script style iframe frame frameset object embed applet template noscript noembed " + "svg math form textarea select option button link meta base title audio video source track canvas dialog").split(" "));
@@ -2694,17 +2906,16 @@
   var diffview = $("#diffview");
   var diffContent = $("#diffcontent");
   var shown = null;
-  function setLayoutPref(mode) {
-    try {
-      localStorage.setItem("px0.diffLayout", mode);
-    } catch {}
+  function setLayoutPref(mode, persist = true) {
+    const split = mode !== "unified";
+    if (!S2.settings)
+      S2.settings = {};
+    S2.settings["diffEditor.renderSideBySide"] = split;
+    if (persist)
+      persistPreference("diffEditor.renderSideBySide", split).catch(() => {});
   }
   function layoutPref() {
-    try {
-      return localStorage.getItem("px0.diffLayout") || "split";
-    } catch {
-      return "split";
-    }
+    return S2.settings?.["diffEditor.renderSideBySide"] === false ? "unified" : "split";
   }
   function syncDiffView() {
     const d = doc_();
@@ -2714,8 +2925,10 @@
       diffview.hidden = !want;
       if (want)
         drawDiff(want);
-      else
+      else {
         diffContent.replaceChildren();
+        diffContent._doc = null;
+      }
     } else if (want && want.diffHunks !== undefined) {
       renderDiff(want);
     }
@@ -2761,8 +2974,8 @@
       try {
         d.diffReq = d.diffReq || api("/api/diff", { path: d.path });
         const j = await d.diffReq;
-        d.diffText = j.diff || "";
-        d.diffHunks = parseDiff(d.diffText);
+        d.diffHunks = parseDiff(j.diff || "");
+        d.diffText = "";
       } catch (e) {
         d.diffText = "";
         d.diffHunks = [];
@@ -2780,6 +2993,21 @@
     }
   }
   function renderDiff(d) {
+    if (d.diffHunks?.length) {
+      const total2 = d.diffHunks.reduce((n, hunk) => {
+        if (d.diffMode === "split")
+          hunk.pairs ||= pairRows(hunk.rows);
+        return n + (d.diffMode === "split" ? hunk.pairs.length : hunk.rows.length);
+      }, 0);
+      d.diffPage = Math.min(d.diffPage || 0, Math.floor(Math.max(0, total2 - 1) / 1000));
+    }
+    const key = d.diffMode + ":" + (d.diffPage || 0);
+    if (diffContent._doc === d && diffContent._key === key) {
+      syncDiffAgentTargets();
+      return;
+    }
+    diffContent._doc = d;
+    diffContent._key = key;
     diffContent.replaceChildren();
     if (!d.diffHunks || !d.diffHunks.length) {
       const p = document.createElement("div");
@@ -2789,9 +3017,40 @@
       return;
     }
     const frag = document.createDocumentFragment();
+    const pageSize = 1000;
+    const total = d.diffHunks.reduce((n, hunk) => {
+      if (d.diffMode === "split")
+        hunk.pairs ||= pairRows(hunk.rows);
+      return n + (d.diffMode === "split" ? hunk.pairs.length : hunk.rows.length);
+    }, 0);
+    const start2 = (d.diffPage || 0) * pageSize;
+    let offset = 0;
     for (const hunk of d.diffHunks) {
+      const data = d.diffMode === "split" ? hunk.pairs : hunk.rows;
+      const from = Math.max(0, start2 - offset);
+      const to = Math.min(data.length, start2 + pageSize - offset);
+      offset += data.length;
+      if (from >= to)
+        continue;
       frag.append(hunkHeader(hunk));
-      frag.append(d.diffMode === "unified" ? unifiedTable(hunk) : splitTable(hunk));
+      frag.append(d.diffMode === "unified" ? unifiedTable(hunk, data.slice(from, to)) : splitTable(hunk, data.slice(from, to)));
+    }
+    if (total > pageSize) {
+      const nav = document.createElement("div");
+      nav.className = "diff-page";
+      for (const [label, page] of [["Previous", (d.diffPage || 0) - 1], ["Next", (d.diffPage || 0) + 1]]) {
+        const button = document.createElement("button");
+        button.textContent = label;
+        button.disabled = page < 0 || page * pageSize >= total;
+        button.addEventListener("click", () => {
+          d.diffPage = page;
+          renderDiff(d);
+          diffview.scrollTop = 0;
+        });
+        nav.append(button);
+      }
+      nav.append(document.createTextNode(" " + (start2 + 1) + "–" + Math.min(total, start2 + pageSize) + " of " + total));
+      frag.prepend(nav);
     }
     diffContent.append(frag);
     syncDiffAgentTargets();
@@ -2843,10 +3102,10 @@
     }
     return hunks;
   }
-  function unifiedTable(hunk) {
+  function unifiedTable(hunk, rows = hunk.rows) {
     const table = document.createElement("div");
     table.className = "diff-table diff-unified";
-    for (const row of hunk.rows) {
+    for (const row of rows) {
       const r = document.createElement("div");
       r.className = "diff-row diff-" + row.type;
       anchor(r, row);
@@ -2855,10 +3114,10 @@
     }
     return table;
   }
-  function splitTable(hunk) {
+  function splitTable(hunk, pairs = pairRows(hunk.rows)) {
     const table = document.createElement("div");
     table.className = "diff-table diff-split";
-    for (const pair of pairRows(hunk.rows)) {
+    for (const pair of pairs) {
       const r = document.createElement("div");
       r.className = "diff-row-pair";
       r.append(splitSide(pair.left, "left"), splitSide(pair.right, "right"));
@@ -3059,22 +3318,23 @@
   }
   var metricsMenuEl = $("#metrics-menu");
   var lastMetrics = null;
+  var metricsTimer = 0;
   function renderMetricsMenu(m) {
     if (!metricsMenuEl || !m)
       return;
     metricsMenuEl.innerHTML = `
     <div class="metrics-title">
-      <span>Process Metrics</span>
+      <span>px0 process (excludes child processes)</span>
       <span class="toast-chip">px0</span>
     </div>
     <div class="metrics-grid">
       <div class="metrics-row">
         <span class="metrics-label">Resident RAM (RSS)</span>
-        <span class="metrics-val">${fmtBytes(m.rssBytes)}</span>
+        <span class="metrics-val">${m.rssAvailable ? fmtBytes(m.rssBytes) : "Unavailable"}</span>
       </div>
       <div class="metrics-row">
         <span class="metrics-label">CPU Usage</span>
-        <span class="metrics-val">${m.cpuUsage.toFixed(1)}%</span>
+        <span class="metrics-val">${m.cpuAvailable ? m.cpuUsage.toFixed(1) + "%" : "Unavailable"}</span>
       </div>
       <div class="metrics-row">
         <span class="metrics-label">Active Goroutines</span>
@@ -3116,9 +3376,9 @@
     const cpuEl = $("#st-cpu");
     const ramEl = $("#st-ram");
     if (cpuEl)
-      cpuEl.textContent = `${m.cpuUsage.toFixed(1)}%`;
+      cpuEl.textContent = m.cpuAvailable ? `${m.cpuUsage.toFixed(1)}%` : "—";
     if (ramEl)
-      ramEl.textContent = fmtBytes(m.rssBytes);
+      ramEl.textContent = m.rssAvailable ? fmtBytes(m.rssBytes) : "—";
     if (metricsMenuEl && !metricsMenuEl.hidden) {
       renderMetricsMenu(m);
       placeMetricsMenu();
@@ -3129,6 +3389,15 @@
       const m = await api("/api/metrics");
       updateMetricsDisplay(m);
     } catch {}
+  }
+  function scheduleMetrics() {
+    clearTimeout(metricsTimer);
+    if (document.visibilityState !== "visible" || !document.hasFocus())
+      return;
+    metricsTimer = setTimeout(async () => {
+      await refreshMetrics();
+      scheduleMetrics();
+    }, 5000);
   }
   function initMetrics() {
     const contEl = $("#st-metrics");
@@ -3152,8 +3421,14 @@
       if (e.key === "Escape")
         closeMetricsMenu();
     });
+    addEventListener("focus", () => {
+      refreshMetrics();
+      scheduleMetrics();
+    });
+    addEventListener("blur", scheduleMetrics);
+    document.addEventListener("visibilitychange", scheduleMetrics);
     refreshMetrics();
-    setInterval(refreshMetrics, 2500);
+    scheduleMetrics();
   }
   var FIT_STEPS = 6;
   var statusEl = $("#status");
@@ -3748,17 +4023,19 @@
   async function openFile(path, opts = {}) {
     const { line, push = true, col } = opts;
     let idx = S2.tabs.findIndex((t) => t.path === path);
+    console.info("[px0 open] start", { path, cached: idx >= 0, line });
     if (idx < 0) {
       let j;
       const start2 = line ? Math.max(0, Math.floor((line - 1) / CHUNK) * CHUNK) : 0;
       try {
         j = await api("/api/file", { path, start: start2, count: CHUNK });
+        console.info("[px0 open] loaded", { path, total: j.total, image: !!j.image });
       } catch (e) {
+        console.error("[px0 open] failed", { path, error: e.message });
         setStatusNote(path + ": " + e.message, 4000);
-        return;
+        return false;
       }
       const isImg = !!j.image;
-      const hasDiff = !isImg && !!j.diffAvailable;
       const d2 = {
         path,
         name: path.split("/").pop(),
@@ -3766,7 +4043,7 @@
         total: isImg ? 0 : j.total,
         maxCols: isImg ? 0 : j.maxCols,
         size: j.size,
-        lines: isImg ? [] : new Array(j.total),
+        lines: Object.create(null),
         chunks: new Set(isImg ? [] : [start2 / CHUNK]),
         pending: new Set,
         refining: new Set,
@@ -3777,16 +4054,14 @@
         markdown: !isImg && !!j.markdown,
         isImage: isImg,
         gutter: null,
-        diffMode: hasDiff ? layoutPref() || "split" : null,
-        diffAvailable: hasDiff,
+        diffMode: null,
+        diffAvailable: false,
         diffDismissed: false
       };
-      if (!isImg) {
-        for (let i = 0;i < j.lines.length; i++)
-          d2.lines[j.start + i] = j.lines[i];
-      }
       d2.lsp = !isImg && j.lsp || { state: "off", server: "" };
       S2.tabs.push(d2);
+      if (!isImg)
+        storeChunk(d2, j);
       idx = S2.tabs.length - 1;
       if (!isImg && j.refine)
         refineChunk(d2, start2 / CHUNK);
@@ -3826,11 +4101,15 @@
       loadOutline();
     if (push)
       pushHistory(path, line || d.cur, col);
+    console.info("[px0 open] active", { path: d.path, tabs: S2.tabs.length });
+    return true;
   }
   function loadGutter(d) {
     if (!S2.meta?.git)
       return;
     api("/api/gutter", { path: d.path }).then((j) => {
+      if (!S2.tabs.includes(d))
+        return;
       d.diffAvailable = !!j.available;
       if (j.available && d.diffMode === null && !d.diffDismissed) {
         d.diffMode = layoutPref() || "split";
@@ -3841,8 +4120,16 @@
       }
       if (doc_() === d)
         updateStatus();
-      if (!j.available)
+      if (!j.available) {
+        d.gutter = null;
+        d.diffMode = null;
+        if (doc_() === d) {
+          syncDiffView();
+          syncPreview();
+          render();
+        }
         return;
+      }
       const marks = new Map;
       for (const n of j.modified)
         marks.set(n, "mod");
@@ -3890,7 +4177,7 @@
         continue;
       }
       const keep = tgt.oldDoc;
-      const hasDiff = !!j.diffAvailable;
+      const hasDiff = keep.diffAvailable;
       const newCur = Math.max(1, Math.min(keep.cur || 1, j.total));
       const diffMode = hasDiff ? keep.diffMode || null : null;
       const d2 = {
@@ -3900,7 +4187,7 @@
         total: j.total,
         maxCols: j.maxCols,
         size: j.size,
-        lines: new Array(j.total),
+        lines: Object.create(null),
         chunks: new Set([tgt.start / CHUNK]),
         pending: new Set,
         refining: new Set,
@@ -3917,11 +4204,9 @@
         diffDismissed: !!keep.diffDismissed || !keep.diffMode,
         diffScroll: keep === activeDoc && keep.diffMode ? diffScrollTop() : 0
       };
-      for (let k = 0;k < j.lines.length; k++) {
-        d2.lines[j.start + k] = j.lines[k];
-      }
       d2.lsp = j.lsp || { state: "off", server: "" };
       S2.tabs[idx] = d2;
+      storeChunk(d2, j);
       if (j.refine)
         refineChunk(d2, tgt.start / CHUNK);
       loadGutter(d2);
@@ -3966,9 +4251,13 @@
       }
       closed.lines = null;
       closed.chunks?.clear?.();
+      closed.chunkCache?.clear?.();
       closed.pending?.clear?.();
       closed.refining?.clear?.();
       closed.outline = null;
+      closed.diffHunks = null;
+      closed.diffText = null;
+      closed.gutter = null;
     }
     if (S2.tabs.length === 0) {
       S2.active = -1;
@@ -4079,7 +4368,6 @@
   }
 
   // web/src/theme.js
-  var KEY = "px0.theme";
   var DEFAULT_THEME = "github-dark";
   var THEME_SELECTOR = /^(?::root|html)?\[data-theme=["']?([\w-]+)["']?\]$/;
   var themes = null;
@@ -4124,37 +4412,37 @@
     return themes;
   }
   var currentTheme = () => document.documentElement.dataset.theme;
-  function setTheme(id, persist = true) {
+  function setTheme(id) {
     if (!listThemes().some((t) => t.id === id))
       return false;
     document.documentElement.dataset.theme = id;
-    if (persist) {
-      try {
-        localStorage.setItem(KEY, id);
-      } catch {}
+    return true;
+  }
+  async function chooseTheme(id) {
+    if (!setTheme(id))
+      return false;
+    try {
+      await persistPreference("workbench.colorTheme", id);
+    } catch (err) {
+      showToast("!", "Could not save theme: " + err.message);
+      return false;
     }
     return true;
   }
-  function cycleTheme() {
+  async function cycleTheme() {
     const all = listThemes();
     if (!all.length)
       return;
     const next = all[(all.findIndex((t) => t.id === currentTheme()) + 1) % all.length];
-    setTheme(next.id);
-    showToast("Theme", next.name);
+    if (await chooseTheme(next.id))
+      showToast("Theme", next.name);
   }
   function initTheme() {
-    let saved = null;
-    try {
-      saved = localStorage.getItem(KEY);
-    } catch {}
-    if (saved && setTheme(saved, false))
-      return;
-    if (setTheme(DEFAULT_THEME, false))
+    if (setTheme(DEFAULT_THEME))
       return;
     const all = listThemes();
     if (all.length && !all.some((t) => t.id === currentTheme()))
-      setTheme(all[0].id, false);
+      setTheme(all[0].id);
   }
 
   // web/src/vim.js
@@ -4183,11 +4471,9 @@
     if (helpBtn)
       helpBtn.hidden = !vimEnabled;
     if (persist) {
-      try {
-        localStorage.setItem("px0.editor.vimMode", vimEnabled ? "true" : "false");
-      } catch {}
       if (S2.settings)
         S2.settings["editor.vimMode"] = vimEnabled;
+      persistPreference("editor.vimMode", vimEnabled).catch(() => {});
     }
   }
   function updateVimCaret() {
@@ -4875,11 +5161,6 @@
   }
   function initVim() {
     let initial = false;
-    try {
-      const val = localStorage.getItem("px0.editor.vimMode");
-      if (val === "true")
-        initial = true;
-    } catch {}
     if (S2.settings && S2.settings["editor.vimMode"] !== undefined) {
       initial = S2.settings["editor.vimMode"] === true || S2.settings["editor.vimMode"] === "true";
     }
@@ -5059,6 +5340,34 @@
       ]
     },
     {
+      key: "workbench.sideBar.location",
+      title: "Sidebar Location",
+      description: "Controls whether the file explorer appears on the left or right.",
+      category: "Workbench",
+      type: "select",
+      default: "left",
+      options: ["left", "right"]
+    },
+    {
+      key: "workbench.sideBar.width",
+      title: "Sidebar Width",
+      description: "Controls the width of the file explorer in pixels.",
+      category: "Workbench",
+      type: "number",
+      default: 228,
+      min: 170,
+      max: 620,
+      step: 1
+    },
+    {
+      key: "workbench.sideBar.visible",
+      title: "Sidebar Visible",
+      description: "Controls whether the file explorer is visible when px0 opens.",
+      category: "Workbench",
+      type: "boolean",
+      default: true
+    },
+    {
       key: "diffEditor.renderSideBySide",
       title: "Diff Side By Side",
       description: "Controls whether the diff editor shows changes in split (side-by-side) or unified mode.",
@@ -5192,6 +5501,7 @@
   var COMMONLY_USED_KEYS = new Set([
     "editor.fontSize",
     "workbench.colorTheme",
+    "workbench.sideBar.location",
     "editor.wordWrap",
     "editor.lineNumbers",
     "editor.vimMode",
@@ -5216,6 +5526,7 @@
           settingsData.defaults = { ...settingsData.defaults, ...data.defaults };
       }
       S2.settings = settingsData.settings || {};
+      S2.settingsSchema = settingsData.schema;
       return settingsData;
     } catch (err) {
       console.warn("Using built-in settings schema (offline/fallback):", err);
@@ -5240,7 +5551,7 @@
       }
       case "editor.wordWrap": {
         const on = val === "on" || val === true;
-        toggleWordWrap(on);
+        toggleWordWrap(on, false);
         break;
       }
       case "editor.lineNumbers": {
@@ -5286,19 +5597,28 @@
       }
       case "workbench.colorTheme": {
         if (val)
-          setTheme(val, true);
+          setTheme(val);
+        break;
+      }
+      case "workbench.sideBar.location": {
+        setSidebarLocation(val === "right" ? "right" : "left");
+        break;
+      }
+      case "workbench.sideBar.width": {
+        setSidebarWidth(Number(val) || 228);
+        break;
+      }
+      case "workbench.sideBar.visible": {
+        setSidebarVisible(val !== false && val !== "false");
         break;
       }
       case "diffEditor.renderSideBySide": {
         const split = val === true || val === "true";
-        setLayoutPref(split ? "split" : "unified");
+        setLayoutPref(split ? "split" : "unified", false);
         break;
       }
       case "markdown.preview.open": {
         S2.mdPreview = val === true || val === "true";
-        try {
-          localStorage.setItem("px0.mdPreview", S2.mdPreview ? "true" : "false");
-        } catch {}
         break;
       }
       case "editor.vimMode": {
@@ -5577,16 +5897,21 @@
     container.innerHTML = html;
   }
   async function handleSettingChange(key, value) {
+    const previous = settingsData.settings?.[key];
     if (!settingsData.settings)
       settingsData.settings = {};
     settingsData.settings[key] = value;
     applySettingLive(key, value);
     renderSettingsList();
     try {
-      const res = await apiPost("/api/settings", { [key]: value });
+      const res = await apiPostJSON("/api/settings", { [key]: value });
       if (res.raw)
         settingsData.raw = res.raw;
     } catch (err) {
+      settingsData.settings[key] = previous;
+      applySettingLive(key, previous);
+      renderSettingsList();
+      showToast("!", "Could not save " + key + ": " + err.message, 5000);
       console.error(`Failed to save setting ${key}:`, err);
     }
   }
@@ -5614,7 +5939,7 @@
       return;
     }
     try {
-      const res = await apiPost("/api/settings", { raw: rawText });
+      const res = await apiPostJSON("/api/settings", { raw: rawText });
       if (res.settings) {
         settingsData.settings = res.settings;
         S2.settings = res.settings;
@@ -5935,9 +6260,7 @@
       }
       if (mod && (e.key === "b" || e.key === "B")) {
         e.preventDefault();
-        document.body.classList.toggle("side-hidden");
-        layout();
-        render();
+        toggleSidebar();
         return;
       }
       if (mod && !e.shiftKey && (e.key === "d" || e.key === "D")) {
@@ -6167,7 +6490,7 @@
     } },
     { name: withKeys("Toggle Word Wrap ({Alt+Z})"), run: () => toggleWordWrap() },
     { name: withKeys("Toggle Markdown Preview ({Alt+M})"), run: () => togglePreview() },
-    { name: withKeys("Toggle Sidebar ({Mod+B})"), run: () => document.body.classList.toggle("side-hidden") },
+    { name: withKeys("Toggle Sidebar ({Mod+B})"), run: toggleSidebar },
     { name: "Select Theme…", run: () => openPalette("theme") },
     { name: "Next Theme", run: cycleTheme },
     { name: "Re-index Workspace", run: () => $("#btn-reindex").click() },
@@ -6204,7 +6527,7 @@
   function closePalette() {
     overlay.hidden = true;
     if (pal && pal.restoreTheme)
-      setTheme(pal.restoreTheme, false);
+      setTheme(pal.restoreTheme);
     pal = null;
   }
   var refreshPalette = debounce(async () => {
@@ -6299,7 +6622,7 @@
     if (s)
       s.scrollIntoView({ block: "nearest" });
     if (pal.mode === "theme")
-      setTheme(pal.items[pal.sel].id, false);
+      setTheme(pal.items[pal.sel].id);
   }
   function movePalette(delta) {
     if (!pal || !pal.items.length)
@@ -6328,7 +6651,7 @@
     } else if (it.kind === "cmd")
       it.cmd.run();
     else if (it.kind === "theme")
-      setTheme(it.id);
+      chooseTheme(it.id);
   }
   function initPalette() {
     palInput.addEventListener("input", refreshPalette);
@@ -6868,13 +7191,7 @@
   (async function boot() {
     try {
       initTheme();
-      const wrapPref = localStorage.getItem("px0.wrap");
-      S2.wrap = wrapPref !== null ? wrapPref === "true" : true;
-      document.body.classList.toggle("word-wrap", S2.wrap);
-      S2.lineNumbers = true;
-      document.body.classList.remove("hide-lines");
-      const mdPref = localStorage.getItem("px0.mdPreview");
-      S2.mdPreview = mdPref !== null ? mdPref === "true" : true;
+      document.body.classList.add("word-wrap");
       updateEditorOptionControls();
     } catch {}
     applyKeyLabels();
@@ -6921,18 +7238,22 @@
       });
     }
     if (S2.meta && !S2.meta.ready) {
-      const timer = setInterval(async () => {
+      let delay = 150;
+      const poll = async () => {
         try {
           const m = await api("/api/meta");
           if (m.ready) {
-            clearInterval(timer);
             S2.meta = m;
             updateStatus();
+            return;
           }
         } catch {
-          clearInterval(timer);
+          return;
         }
-      }, 150);
+        delay = Math.min(delay * 2, 1000);
+        setTimeout(poll, delay);
+      };
+      setTimeout(poll, delay);
     }
     loadAgentAsync();
   })();

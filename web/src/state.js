@@ -7,14 +7,30 @@ const request = async (method, path, params, opts = {}) => {
   const u = new URL(path, location.origin);
   for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== '') u.searchParams.set(k, v);
   const r = await fetch(u, { method, ...opts });
-  const j = await r.json();
+  let j;
+  try { j = await r.json(); }
+  catch { throw new Error(`${method} ${path} failed (${r.status})`); }
   // The body rides along: some replies, like a failed agent job, carry detail beyond the message.
-  if (j.error) throw Object.assign(new Error(j.error), { body: j });
+  if (!r.ok || j.error) throw Object.assign(new Error(j.error || `${method} ${path} failed (${r.status})`), { body: j });
   return j;
 };
 export const api = (path, params, opts) => request('GET', path, params, opts);
 // For requests that change the machine; the server only accepts these as POST from this page.
 export const apiPost = (path, params, opts) => request('POST', path, params, opts);
+export const apiPostJSON = (path, body, opts = {}) => request('POST', path, null, {
+  ...opts,
+  headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  body: JSON.stringify(body),
+});
+
+export async function persistPreference(key, value) {
+  const res = await apiPostJSON('/api/settings', { [key]: value });
+  if (res.settings) {
+    if (!S.settings) S.settings = {};
+    Object.assign(S.settings, res.settings);
+  }
+  return res;
+}
 
 export const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 // navigator.platform is deprecated but is still the only signal some browsers give.

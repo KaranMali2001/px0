@@ -228,3 +228,8 @@ The explicit first-run pick matters for the same reason. Auto-enabling on discov
 - Changes to gitignored files are invisible to `git status`, so they are never reloaded.
 - Instructions live in memory for the life of the process. Only the harness choice is persisted, and never inside a workspace.
 - Leaving the tab while an edit is in flight is guarded by a `beforeunload` prompt, but closing the browser process outright or losing power still abandons the harness mid-run with no undo to fall back on.
+
+
+## Workspace Shutdown
+
+Folder replacement and application shutdown close the agent manager, refuse new dispatches, cancel running harnesses and their Unix process groups, and join job completion. Subprocess pipe waits are bounded. Git snapshots use the job context so cancellation does not leave an uncancellable status request; cancelled jobs skip settlement rather than treating a missing snapshot as file changes. Harness writes already made remain on disk.

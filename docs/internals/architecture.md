@@ -7,12 +7,12 @@ This document describes the high-level architecture, startup pipeline, HTTP serv
 px0 is engineered as an ultra-fast, zero-overhead code exploration console. Its architecture is guided by five foundational tenets:
 
 1. Edits Are Delegated: px0 navigates, searches, and inspects code, and does not author changes itself. There are no save buttons and no endpoint accepts file content. Changes are made by a coding harness px0 dispatches on request, one per non-overlapping line range so several can run at once (see [Harness Editing & Agent Dispatch](agent-editing.md)).
-1. Single Static Binary Footprint: All frontend assets (HTML, CSS, JavaScript, icons, themes) are embedded directly into the Go binary at compile time via `go:embed`. px0 requires no Node.js, Python, or Ruby runtime, no external database, and no CGO dependencies.
-1. Sub-Millisecond Responsiveness: The HTTP listener binds, serves the web UI, and opens the default browser in under 1 millisecond. Heavy operations (full directory indexing, git status checks, language server binary discovery) run asynchronously off the critical path.
-1. Stateless in the Workspace: px0 never writes configuration directories, temporary caches, or metadata files (e.g., `.px0/` or `.cache/`) into a workspace. Indexes and caches live in volatile memory. Outside the workspace it keeps only the remembered harness choice and update/telemetry state under `~/.px0/` (or `$XDG_CONFIG_HOME/px0/`).
+1. Single Static Binary Footprint: All frontend assets (HTML, CSS, JavaScript, icons, themes) are embedded directly into the Go binary at compile time via `go:embed`. The CLI supports `CGO_ENABLED=0` and requires no JavaScript runtime or external database. The optional macOS desktop app uses Wails, CGO, and system Cocoa/WebKit/UniformTypeIdentifiers frameworks. RSS sampling on macOS uses `/bin/ps`.
+1. Sub-Millisecond Responsiveness: The CLI starts its HTTP listener and launches the browser without waiting for indexing. Startup latency depends on the host and workspace; desktop startup also initializes Wails/WebKit. Heavy operations (full directory indexing, git status checks, language server binary discovery) run asynchronously off the critical path.
+1. Stateless in the Workspace: px0 never writes configuration directories, temporary caches, or metadata files (e.g., `.px0/` or `.cache/`) into a workspace. Indexes and caches live in volatile memory. Outside the workspace it keeps user preferences, the harness choice, desktop last-folder record, and update/telemetry state under `~/.px0/` (or `$XDG_CONFIG_HOME/px0/`).
 1. Strict Memory Reclamation: Long-lived background processes should not hold idle RAM. When the user finishes a burst of queries, unused pages are proactively returned to the operating system.
 
-## 2. Startup Pipeline (<1 ms Critical Path)
+## 2. CLI Startup Pipeline
 
 When `px0` is executed in a terminal (e.g., `px0 .` or `px0 main.go:42`), the initialization flow executes as follows. A file target detects its enclosing project repository (or working directory) as the workspace and is passed to the browser with its relative path and optional line number.
 
@@ -50,7 +50,7 @@ sequenceDiagram
 
 ## 3. HTTP Server & API Catalog
 
-The server is implemented in [`server.go`](../../server.go) using Go's standard `http.ServeMux`. Every request passes through a centralized `ServeHTTP` wrapper that records activity timestamps and applies pooled Gzip compression when accepted by the client.
+The server is implemented in [`server.go`](../../server.go) using Go's standard `http.ServeMux`. Every request passes through a centralized `ServeHTTP` wrapper that records navigation activity (excluding metrics, metadata, and static assets) and applies pooled Gzip compression when accepted by the client.
 
 ### Endpoints Reference
 
@@ -60,8 +60,8 @@ The server is implemented in [`server.go`](../../server.go) using Go's standard 
 | `/static/*`           | `GET`  | Serves bundled JavaScript, CSS, and static assets                       | Asset MIME type                            |
 | `/static/themes.css`  | `GET`  | Concatenates all `web/themes/*.css` files in alphanumeric order         | `text/css; charset=utf-8`                  |
 | `/api/meta`           | `GET`  | Workspace metadata (root path, file count, index duration, git status)  | JSON (`{root, name, files, build_ms, git}`)|
-| `/api/metrics`        | `GET`  | Runtime memory and GC stats (`Alloc`, `Sys`, `NumGC`, etc.)             | JSON                                       |
-| `/api/tree`           | `GET`  | Directory contents for the sidebar file explorer (`?dir=path`)          | JSON array of `Node` objects               |
+| `/api/metrics`        | `GET`  | OS process RSS/CPU with availability flags; excludes child processes             | JSON                                       |
+| `/api/tree`           | `GET`  | Directory page (`?dir=path&offset=0`, optional `seek=path`)          | JSON (`{children, total, offset, pageSize}`)               |
 | `/api/file`           | `GET`  | Windowed, highlighted source file lines (`?path=...&start=0&count=500`) | JSON (`{lines, total, refine, markdown}`)  |
 | `/api/raw`            | `GET`  | Raw, unhighlighted file content for whole-file copies and preview assets| `text/plain` or binary                     |
 | `/api/markdown`       | `GET`  | Converted HTML preview of `.md` / `.markdown` files via goldmark        | JSON (`{path, html}`)                      |
@@ -91,7 +91,7 @@ The server is implemented in [`server.go`](../../server.go) using Go's standard 
 
 Even though Go's garbage collector frees unreferenced heap objects rapidly, the Go runtime does not immediately release physical memory pages back to the host operating system. In high-churn CLI sessions (such as searching a 50,000-file repository), the process resident set size (RSS) could appear inflated long after the search completes.
 
-To maintain a lean footprint (~20 MB RSS), `server.go` implements an automatic scavenger:
+To return unused Go heap pages after navigation bursts, `server.go` implements an automatic scavenger:
 
 ```go
 func (s *Server) scavenge() {
@@ -99,7 +99,12 @@ func (s *Server) scavenge() {
     tick := time.NewTicker(10 * time.Second)
     defer tick.Stop()
     done := true
-    for range tick.C {
+    for {
+        select {
+        case <-s.ctx.Done():
+            return
+        case <-tick.C:
+        }
         idle := time.Since(time.Unix(0, s.lastReq.Load()))
         if idle < idleFor {
             done = false
@@ -164,3 +169,16 @@ The `/api/lsp/install` and `/api/lsp/start` endpoints execute shell commands (e.
 ### Self-Update Integrity
 
 Before `px0 --update` executes or installs a release binary, it verifies the download against the SHA-256 digest in that release's `checksums.txt` asset. Missing, malformed, or mismatched checksum data aborts the update without replacing the current executable.
+
+
+## Workspace Lifetime and Native Startup
+
+`Server.Close` closes admission, cancels request/index contexts, cancels and joins agent/install/LSP work, stops the scavenger, drains requests and indexing, and evicts the workspace's highlighted documents and Git probe entry. Desktop folder replacement closes the old server before installing the next one; shutdown closes the active workspace. WaitGroup admission is synchronized with the closed flag so no work is added after shutdown starts waiting.
+
+Desktop startup adds standard binary directories immediately. Login-shell PATH discovery runs after window startup with a three-second context, process-group cancellation on Unix, and bounded pipe waits; language-server discovery is rescanned afterward. Failed shell discovery keeps the existing PATH.
+
+`/static/app.js` and `/static/style.css` resolve in `web/`; fonts, logos, and favicons resolve in `web/static/`. Both embedded and development assets use these routes.
+
+Metrics report current px0-process RSS on Linux and macOS and CPU time from OS resource usage on supported Unix systems. Unavailable readings are flagged rather than substituting Go `MemStats.Sys` for RSS. These numbers exclude WebKit, LSP, and harness child processes. Memory budgets account for retained source/HTML, not peak RSS or native allocations.
+
+Lifetime and subprocess handling follows the official Go documentation for [context cancellation](https://pkg.go.dev/context#AfterFunc), [WaitGroup admission](https://pkg.go.dev/sync#WaitGroup), and [CommandContext/WaitDelay](https://pkg.go.dev/os/exec#Cmd). Cancellation must be joined explicitly. The [Go GC guide](https://go.dev/doc/gc-guide) explains why a runtime memory limit does not bound native or child-process memory.

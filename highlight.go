@@ -3,8 +3,10 @@ package main
 import (
 	"container/list"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -107,6 +109,8 @@ func classFor(t chroma.TokenType) string {
 
 var htmlEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
+var tsMethodDecl = regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|async|readonly|abstract|override|declare|export|default|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>)?\s*\([^\n]*\)\s*(?::\s*[^={]+)?\s*\{`)
+
 // visualWidth counts runes, expanding tabs to the 4-column stops the UI uses.
 func visualWidth(s string) int {
 	n := 0
@@ -128,14 +132,16 @@ type Doc struct {
 	Total   int
 
 	src     string
-	lineOff []int // lineOff[i] is the byte offset of line i; lineOff[Total] == len(src)
+	lineOff []uint32 // Files are capped at 64 MiB, so offsets fit in 32 bits.
 	lexer   chroma.Lexer
 
 	mu     sync.RWMutex
 	chunks map[int][]string
 	full   bool
 
-	bgOnce sync.Once
+	bgOnce     sync.Once
+	retired    chan struct{}
+	retireOnce sync.Once
 
 	// key identifies this document in the cache so the chunks it accumulates
 	// can be charged against the budget as they appear. Sizing a document once
@@ -146,29 +152,41 @@ type Doc struct {
 }
 
 func newDoc(src, rel string) *Doc {
-	raw := strings.Split(src, "\n")
+	total := strings.Count(src, "\n") + 1
 	d := &Doc{
-		src: src, Total: len(raw), chunks: map[int][]string{},
-		lineOff: make([]int, len(raw)+1),
+		src: src, Total: total, chunks: map[int][]string{},
+		retired: make(chan struct{}),
+		lineOff: make([]uint32, total+1),
 		// Source plus line table. Rendered chunks are charged as they appear.
-		bytes: len(src) + len(raw)*32,
+		bytes: len(src) + (total+1)*4,
 	}
 	off := 0
-	for i, l := range raw {
-		d.lineOff[i] = off
-		off += len(l) + 1
-		if n := visualWidth(l); n > d.MaxCols {
+	for i := 0; i < total; i++ {
+		d.lineOff[i] = uint32(off)
+		end := strings.IndexByte(src[off:], '\n')
+		if end < 0 {
+			end = len(src) - off
+		}
+		line := src[off : off+end]
+		if len(line) > maxReportedCols*4 {
+			line = line[:maxReportedCols*4]
+		}
+		if n := visualWidth(line); n > d.MaxCols {
 			d.MaxCols = n
+		}
+		off += end
+		if off < len(src) {
+			off++
 		}
 	}
 	if d.MaxCols > maxReportedCols {
 		d.MaxCols = maxReportedCols
 	}
-	d.lineOff[len(raw)] = len(src)
+	d.lineOff[total] = uint32(len(src))
 
 	d.lexer = lexers.Match(filepath.Base(rel))
 	if d.lexer == nil {
-		d.lexer = lexers.Analyse(src)
+		d.lexer = lexers.Analyse(src[:min(len(src), 64<<10)])
 	}
 	if d.lexer == nil {
 		d.Lang = "plain text"
@@ -184,8 +202,8 @@ func (d *Doc) Raw(n int) string {
 	if n < 1 || n > d.Total {
 		return ""
 	}
-	start := d.lineOff[n-1]
-	end := d.lineOff[n]
+	start := int(d.lineOff[n-1])
+	end := int(d.lineOff[n])
 	if end > start && end <= len(d.src) && end > 0 && d.src[end-1] == '\n' {
 		end--
 	}
@@ -252,6 +270,11 @@ func (d *Doc) Lines(start, end int) ([]string, bool) {
 func (d *Doc) Exact() (done, coming bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	select {
+	case <-d.retired:
+		return d.full, false
+	default:
+	}
 	return d.full, len(d.src) <= bgLimit
 }
 
@@ -303,7 +326,7 @@ func (d *Doc) chunk(c int) ([]string, bool) {
 	d.chunks[c] = v
 	d.mu.Unlock()
 	if !had {
-		cache.grow(d.key, sizeOfLines(v))
+		cache.grow(d, sizeOfLines(v))
 	}
 	return v, full
 }
@@ -318,8 +341,32 @@ func sizeOfLines(lines []string) int {
 
 // backgroundPass lexes the file end to end, which both fixes any window whose
 // context was not deep enough and makes every subsequent chunk free.
+var backgroundSlots = make(chan struct{}, 2)
+
+func (d *Doc) retire() {
+	if d.retired != nil {
+		d.retireOnce.Do(func() { close(d.retired) })
+	}
+}
+
 func (d *Doc) backgroundPass() {
+	select {
+	case <-d.retired:
+		return
+	default:
+	}
+	select {
+	case backgroundSlots <- struct{}{}:
+	case <-d.retired:
+		return
+	}
+	defer func() { <-backgroundSlots }()
 	all := d.tokenise(d.src, d.Total)
+	select {
+	case <-d.retired:
+		return
+	default:
+	}
 	d.mu.Lock()
 	before := 0
 	for _, v := range d.chunks {
@@ -336,12 +383,29 @@ func (d *Doc) backgroundPass() {
 	}
 	d.full = true
 	d.mu.Unlock()
-	cache.grow(d.key, after-before)
+	cache.grow(d, after-before)
 }
 
 // tokenise renders one contiguous run of source into exactly want lines of HTML.
 func (d *Doc) tokenise(src string, want int) []string {
 	return highlightLines(d.lexer, src, want)
+}
+
+type methodSpan struct{ start, end int }
+
+func typeScriptMethodOffsets(src string) []methodSpan {
+	var methods []methodSpan
+	for offset := 0; offset < len(src); {
+		line, rest, found := strings.Cut(src[offset:], "\n")
+		if m := tsMethodDecl.FindStringSubmatchIndex(line); m != nil {
+			methods = append(methods, methodSpan{offset + m[2], offset + m[3]})
+		}
+		if !found {
+			break
+		}
+		offset = len(src) - len(rest)
+	}
+	return methods
 }
 
 // highlightLines lexes src into exactly want lines of HTML, one <i class=...>
@@ -350,6 +414,12 @@ func highlightLines(lexer chroma.Lexer, src string, want int) (out []string) {
 	out = make([]string, 0, want)
 	var b strings.Builder
 	b.Grow(256)
+	var methods []methodSpan
+	if lexer != nil && lexer.Config().Name == "TypeScript" {
+		methods = typeScriptMethodOffsets(src)
+	}
+	position := 0
+	methodIndex := 0
 
 	emit := func(v, cls string) {
 		if v == "" {
@@ -382,23 +452,47 @@ func highlightLines(lexer chroma.Lexer, src string, want int) (out []string) {
 			out = plainFallback(src, want)
 		}
 	}()
+	emitValue := func(v, cls string) {
+		for {
+			i := strings.IndexByte(v, '\n')
+			if i < 0 {
+				emit(v, cls)
+				position += len(v)
+				return
+			}
+			emit(v[:i], cls)
+			position += i + 1
+			out = append(out, b.String())
+			b.Reset()
+			v = v[i+1:]
+		}
+	}
 
 	// Consume the iterator directly, cutting lines as newlines go by. Building
 	// the full token slice first would double the allocations for no gain.
 	for t := it(); t != chroma.EOF; t = it() {
 		cls := classFor(t.Type)
 		v := t.Value
-		for {
-			i := strings.IndexByte(v, '\n')
-			if i < 0 {
-				emit(v, cls)
-				break
-			}
-			emit(v[:i], cls)
-			out = append(out, b.String())
-			b.Reset()
-			v = v[i+1:]
+		end := position + len(v)
+		for methodIndex < len(methods) && methods[methodIndex].end <= position {
+			methodIndex++
 		}
+		if t.Type == chroma.Text || t.Type.InCategory(chroma.Name) {
+			for methodIndex < len(methods) && methods[methodIndex].start < end {
+				span := methods[methodIndex]
+				methodIndex++
+				if span.start < position || span.end > end {
+					continue
+				}
+				prefix := span.start - position
+				emitValue(v[:prefix], cls)
+				v = v[prefix:]
+				name := span.end - span.start
+				emitValue(v[:name], "nf")
+				v = v[name:]
+			}
+		}
+		emitValue(v, cls)
 	}
 	if b.Len() > 0 {
 		out = append(out, b.String())
@@ -448,28 +542,30 @@ func (c *hlCache) get(key string) *Doc {
 	return nil
 }
 
-func (c *hlCache) put(key string, v *Doc) {
+func (c *hlCache) put(key string, v *Doc) *Doc {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.items[key]; ok {
 		c.ll.MoveToFront(el)
-		return
+		return el.Value.(*hlItem).val
 	}
 	c.items[key] = c.ll.PushFront(&hlItem{key: key, val: v})
 	c.used += v.bytes
 	c.evict()
+	return v
 }
 
 // grow charges newly rendered chunks to a document already in the cache, and
 // evicts colder documents if that puts the cache over budget.
-func (c *hlCache) grow(key string, delta int) {
+func (c *hlCache) grow(d *Doc, delta int) {
+	key := d.key
 	if key == "" || delta == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.items[key]
-	if !ok {
+	if !ok || el.Value.(*hlItem).val != d {
 		return
 	}
 	el.Value.(*hlItem).val.bytes += delta
@@ -477,15 +573,15 @@ func (c *hlCache) grow(key string, delta int) {
 	c.evict()
 }
 
-// evict drops the least recently used documents until the cache fits. The most
-// recent entry is never evicted, so the document being read always survives.
+// Active requests retain their document even if it no longer fits the cache.
 func (c *hlCache) evict() {
-	for c.used > cacheBudget && c.ll.Len() > 1 {
+	for c.used > cacheBudget && c.ll.Len() > 0 {
 		back := c.ll.Back()
 		it := back.Value.(*hlItem)
 		c.ll.Remove(back)
 		delete(c.items, it.key)
 		c.used -= it.val.bytes
+		it.val.retire()
 	}
 }
 
@@ -501,10 +597,28 @@ func (c *hlCache) remove(abs string) bool {
 			c.ll.Remove(el)
 			delete(c.items, k)
 			c.used -= it.val.bytes
+			it.val.retire()
 			removed = true
 		}
 	}
 	return removed
+}
+
+func (c *hlCache) removeRoot(root string) {
+	prefix := filepath.Clean(root)
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, el := range c.items {
+		if strings.HasPrefix(key, prefix) {
+			el.Value.(*hlItem).val.retire()
+			c.used -= el.Value.(*hlItem).val.bytes
+			c.ll.Remove(el)
+			delete(c.items, key)
+		}
+	}
 }
 
 // Evict drops a file from the syntax highlighting cache by absolute path.
@@ -542,15 +656,22 @@ func Open(abs, rel string) (*Doc, error) {
 	if d := cache.get(key); d != nil {
 		return d, nil
 	}
-	data, err := os.ReadFile(abs)
+	f, err := os.Open(abs)
 	if err != nil {
 		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxFileBytes {
+		return nil, fmt.Errorf("file grew beyond the %d-byte limit", maxFileBytes)
 	}
 	if isBinary(data) {
 		return nil, fmt.Errorf("binary file")
 	}
 	d := newDoc(strings.ReplaceAll(string(data), "\r\n", "\n"), rel)
 	d.key = key
-	cache.put(key, d)
-	return d, nil
+	return cache.put(key, d), nil
 }

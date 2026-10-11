@@ -1,13 +1,127 @@
 package main
 
 import (
+	"container/list"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 )
+
+func TestTypeScriptMethodMarkupPreservesSource(t *testing.T) {
+	strip := regexp.MustCompile(`<[^>]*>`)
+	for _, src := range []string{
+		"  i() {",
+		"  s() {",
+		"  async s() {",
+		"  private i() {",
+		"  static staticMethod() {",
+		"  get getValue() {",
+	} {
+		t.Run(src, func(t *testing.T) {
+			d := newDoc(src+"\n", "methods.ts")
+			line := d.tokenise(d.src, d.Total)[0]
+			if got := html.UnescapeString(strip.ReplaceAllString(line, "")); got != src {
+				t.Fatalf("source changed: %q, markup %q", got, line)
+			}
+			if strings.Count(line, `<i class=nf>`) != 1 {
+				t.Fatalf("method not styled exactly once: %q", line)
+			}
+		})
+	}
+	for _, src := range []string{"// i() {", "const value = 's() {'", "/*\n  i() {\n*/"} {
+		d := newDoc(src, "comments.ts")
+		for _, line := range d.tokenise(src, d.Total) {
+			if strings.Contains(line, `<i class=nf>`) {
+				t.Fatalf("styled a comment/string: %q", line)
+			}
+		}
+	}
+}
+
+func TestLineOffsetsPreserveEmptyAndUnicodeLines(t *testing.T) {
+	for _, src := range []string{"", "\n", "one\n", "one\n\nthree", "é\n\t世界"} {
+		d := newDoc(src, "plain.txt")
+		lines := strings.Split(src, "\n")
+		if d.Total != len(lines) {
+			t.Fatalf("total = %d, want %d", d.Total, len(lines))
+		}
+		for i, line := range lines {
+			if d.Raw(i+1) != line {
+				t.Fatalf("line %d = %q, want %q", i+1, d.Raw(i+1), line)
+			}
+		}
+	}
+}
+
+func TestHighlightCacheRejectsOversizedNewestDocument(t *testing.T) {
+	c := &hlCache{ll: list.New(), items: map[string]*list.Element{}}
+	d := &Doc{bytes: cacheBudget + 1}
+	c.put("oversized", d)
+	if c.used > cacheBudget || c.get("oversized") != nil {
+		t.Fatal("cache retained oversized newest document")
+	}
+	if d.bytes != cacheBudget+1 {
+		t.Fatal("eviction changed active request's document")
+	}
+}
+
+func TestCacheCoalescesConcurrentOpenDocuments(t *testing.T) {
+	abs := filepath.Join(t.TempDir(), "concurrent.go")
+	if err := os.WriteFile(abs, []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { Evict(abs) })
+	var wg sync.WaitGroup
+	docs := make(chan *Doc, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, err := Open(abs, "concurrent.go")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			docs <- d
+		}()
+	}
+	wg.Wait()
+	close(docs)
+	var first *Doc
+	for d := range docs {
+		if first == nil {
+			first = d
+		}
+		if d != first {
+			t.Fatal("concurrent opens returned uncached duplicates")
+		}
+	}
+}
+
+func TestRetiredDocumentDoesNotRefine(t *testing.T) {
+	d := newDoc("package main\n", "retired.go")
+	d.retire()
+	d.backgroundPass()
+	if done, coming := d.Exact(); done || coming {
+		t.Fatal("retired document still scheduled refinement")
+	}
+}
+
+func TestTypeScriptMethodNamesAreHighlighted(t *testing.T) {
+	d := newDoc("  async getPaymentById(paymentId: number) {\n    return this.paymentDao.getPaymentById(paymentId)\n  }\n", "PaymentService.ts")
+	lines := d.tokenise(d.src, d.Total)
+	if !strings.Contains(lines[0], `<i class=nf>getPaymentById</i>`) {
+		t.Fatalf("method declaration was not highlighted: %q", lines[0])
+	}
+	if strings.Contains(lines[1], `<i class=nf>getPaymentById</i>`) {
+		t.Fatalf("method call must remain unstyled: %q", lines[1])
+	}
+}
 
 // Windowed lexing must agree with a full-file pass, or the view changes under
 // the user when the background pass lands.

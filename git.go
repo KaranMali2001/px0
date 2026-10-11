@@ -1,12 +1,57 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
+
+var errGitOutputLimit = errors.New("Git output exceeds the 16 MiB preview limit")
+
+type gitOutputBuffer struct {
+	bytes.Buffer
+	cancel   context.CancelFunc
+	exceeded bool
+}
+
+func (b *gitOutputBuffer) Write(p []byte) (int, error) {
+	if b.Len()+len(p) > 16<<20 {
+		b.exceeded = true
+		if b.cancel != nil {
+			b.cancel()
+		}
+		return 0, errGitOutputLimit
+	}
+	return b.Buffer.Write(p)
+}
+
+func gitOutput(parent context.Context, root string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...)
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error { return killCommand(cmd) }
+	cmd.WaitDelay = 100 * time.Millisecond
+	out := gitOutputBuffer{cancel: cancel}
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if cmd.Process != nil {
+		killCommand(cmd)
+	}
+	if out.exceeded {
+		return nil, errGitOutputLimit
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return out.Bytes(), err
+}
 
 // gitDisabled turns off all git awareness (the -no-git flag). Like uiQuiet, a
 // process-wide switch set once in main before anything reads it.
@@ -28,21 +73,30 @@ var (
 func gitAvailable(root string) bool { return gitProbe(root).ok }
 
 func gitProbe(root string) gitInfo {
+	return gitProbeContext(context.Background(), root)
+}
+
+func gitProbeContext(ctx context.Context, root string) gitInfo {
 	if gitDisabled {
 		return gitInfo{}
 	}
 	gitMu.Lock()
-	defer gitMu.Unlock()
 	if info, ok := gitCache[root]; ok {
+		gitMu.Unlock()
 		return info
 	}
+	gitMu.Unlock()
 	var info gitInfo
 	if _, err := exec.LookPath("git"); err == nil {
-		if out, err := exec.Command("git", "-C", root, "rev-parse", "--show-toplevel").Output(); err == nil {
+		if out, err := gitOutput(ctx, root, "rev-parse", "--show-toplevel"); err == nil {
 			info = gitInfo{ok: true, toplevel: strings.TrimSpace(string(out))}
 		}
 	}
-	gitCache[root] = info
+	if ctx.Err() == nil {
+		gitMu.Lock()
+		gitCache[root] = info
+		gitMu.Unlock()
+	}
 	return info
 }
 
@@ -50,11 +104,15 @@ func gitProbe(root string) gitInfo {
 // every file git considers changed. Uses porcelain v2 -z, the stable
 // null-delimited format. Fails quiet: nil on any error, no repo, or disabled.
 func gitStatus(root string) map[string]string {
-	info := gitProbe(root)
+	return gitStatusContext(context.Background(), root)
+}
+
+func gitStatusContext(ctx context.Context, root string) map[string]string {
+	info := gitProbeContext(ctx, root)
 	if !info.ok {
 		return nil
 	}
-	out, err := exec.Command("git", "-C", root, "status", "--porcelain=v2", "-z").Output()
+	out, err := gitOutput(ctx, root, "status", "--porcelain=v2", "-z")
 	if err != nil {
 		return nil
 	}
@@ -145,14 +203,23 @@ func mapXY(xy string) string {
 // gitDiff returns the unified diff of relpath against HEAD. relpath is relative
 // to the served root; git resolves it against -C root. Fails quiet -> "".
 func gitDiff(root, relpath string) string {
-	if !gitAvailable(root) {
-		return ""
+	diff, _ := gitDiffContext(context.Background(), root, relpath)
+	return diff
+}
+
+func gitDiffContext(ctx context.Context, root, relpath string) (string, error) {
+	if !gitProbeContext(ctx, root).ok {
+		return "", ctx.Err()
 	}
-	out, err := exec.Command("git", "-C", root, "diff", "--no-color", "HEAD", "--", relpath).Output()
+	out, err := gitOutput(ctx, root, "diff", "--no-color", "HEAD", "--", relpath)
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return "", nil
+	}
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return string(out)
+	return string(out), nil
 }
 
 // gitHunks parses the unified diff of relpath against HEAD into 1-based
@@ -161,7 +228,10 @@ func gitDiff(root, relpath string) string {
 // preceding the removed run; 0 means "before the first line"). Fails quiet:
 // empty when git is off/unavailable or the file has no diff (clean/untracked).
 func gitHunks(root, relpath string) (added, modified, deleted []int) {
-	diff := gitDiff(root, relpath)
+	return gitHunksFromDiff(gitDiff(root, relpath))
+}
+
+func gitHunksFromDiff(diff string) (added, modified, deleted []int) {
 	if diff == "" {
 		return nil, nil, nil
 	}

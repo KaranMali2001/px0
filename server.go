@@ -44,16 +44,40 @@ type Server struct {
 	agent *agentManager // nil unless main wires editing for this session
 	mux   *http.ServeMux
 
-	lastReq atomic.Int64 // unix nanos of the most recent request
+	lastReq    atomic.Int64 // unix nanos of the most recent request
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closeOnce  sync.Once
+	mu         sync.Mutex
+	closed     bool
+	requests   sync.WaitGroup
+	background sync.WaitGroup
+	scavenged  chan struct{}
+}
+
+type desktopRequestKey struct{}
+
+func trustedDesktopRequest(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), desktopRequestKey{}, true))
+}
+
+func isTrustedDesktopRequest(r *http.Request) bool {
+	trusted, _ := r.Context().Value(desktopRequestKey{}).(bool)
+	return trusted
 }
 
 func NewServer(ix *Index, lsp *lspManager) *Server {
 	if lsp == nil {
 		lsp = newLSPManager(ix.Root(), false)
 	}
-	s := &Server{ix: ix, lsp: lsp, mux: http.NewServeMux()}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{ix: ix, lsp: lsp, mux: http.NewServeMux(), ctx: ctx, cancel: cancel, scavenged: make(chan struct{})}
 	sub, _ := fs.Sub(assets, "web")
 	s.mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(sub))))
+	static, _ := fs.Sub(sub, "static")
+	for _, path := range []string{"/static/fonts/", "/static/logo/", "/static/favicon.ico", "/static/favicon-16x16.png", "/static/favicon-32x32.png"} {
+		s.mux.Handle(path, http.StripPrefix("/static/", http.FileServer(http.FS(static))))
+	}
 	s.mux.HandleFunc("/static/themes.css", s.handleThemes)
 	s.mux.HandleFunc("/", s.handleIndex)
 	s.mux.HandleFunc("/api/meta", s.handleMeta)
@@ -95,11 +119,17 @@ func NewServer(ix *Index, lsp *lspManager) *Server {
 // runtime is in no hurry to return it. That is harmless but it makes a process
 // that is doing nothing look like it is holding hundreds of megabytes.
 func (s *Server) scavenge() {
+	defer close(s.scavenged)
 	const idleFor = 15 * time.Second
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
 	done := true // nothing to release before the first request
-	for range tick.C {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-tick.C:
+		}
 		idle := time.Since(time.Unix(0, s.lastReq.Load()))
 		if idle < idleFor {
 			done = false
@@ -113,8 +143,59 @@ func (s *Server) scavenge() {
 	}
 }
 
+func (s *Server) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.cancel()
+		s.mu.Unlock()
+		s.agent.Close()
+		s.lsp.Close()
+		s.requests.Wait()
+		s.background.Wait()
+		<-s.scavenged
+		cache.removeRoot(s.ix.Root())
+		gitMu.Lock()
+		delete(gitCache, s.ix.Root())
+		gitMu.Unlock()
+	})
+}
+
+func (s *Server) buildIndex() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.background.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.background.Done()
+		s.ix.BuildContext(s.ctx)
+	}()
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.lastReq.Store(time.Now().UnixNano())
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		fail(w, http.StatusServiceUnavailable, "workspace closed")
+		return
+	}
+	s.requests.Add(1)
+	s.mu.Unlock()
+	defer s.requests.Done()
+	ctx, cancel := context.WithCancel(r.Context())
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
+	defer cancel()
+	r = r.WithContext(ctx)
+	if r.URL.Path != "/api/metrics" && r.URL.Path != "/api/meta" && !strings.HasPrefix(r.URL.Path, "/static/") {
+		s.lastReq.Store(time.Now().UnixNano())
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		s.mux.ServeHTTP(w, r)
@@ -482,7 +563,19 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "not indexed: "+dir)
 		return
 	}
-	writeJSON(w, map[string]any{"dir": dir, "children": kids})
+	const pageSize = 500
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	if seek := r.URL.Query().Get("seek"); seek != "" {
+		for i, kid := range kids {
+			if kid.Path == seek {
+				offset = i / pageSize * pageSize
+				break
+			}
+		}
+	}
+	offset = max(0, min(offset, max(0, len(kids)-1)))
+	end := min(len(kids), offset+pageSize)
+	writeJSON(w, map[string]any{"dir": dir, "children": kids[offset:end], "total": len(kids), "offset": offset, "pageSize": pageSize})
 }
 
 func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
@@ -549,17 +642,12 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	lines, exact := d.Lines(start, start+count)
 	_, coming := d.Exact()
-	diffAvail := false
-	if gitAvailable(s.ix.Root()) {
-		diffAvail = gitDiff(s.ix.Root(), rel) != ""
-	}
 	writeJSON(w, map[string]any{
 		"path": rel, "lang": d.Lang, "total": d.Total, "maxCols": d.MaxCols,
 		"start": start, "lines": lines, "size": st.Size(),
 		"exact": exact, "refine": !exact && coming,
-		"markdown":      isMarkdown(rel),
-		"diffAvailable": diffAvail,
-		"lsp":           s.lspBrief(rel),
+		"markdown": isMarkdown(rel),
+		"lsp":      s.lspBrief(rel),
 	})
 }
 
@@ -596,7 +684,11 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "bad path")
 		return
 	}
-	diff := gitDiff(s.ix.Root(), rel)
+	diff, err := gitDiffContext(r.Context(), s.ix.Root(), rel)
+	if err != nil {
+		fail(w, 503, err.Error())
+		return
+	}
 	if uiVerbose {
 		status := "clean"
 		if diff != "" {
@@ -617,7 +709,12 @@ func (s *Server) handleGutter(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "bad path")
 		return
 	}
-	added, modified, deleted := gitHunks(s.ix.Root(), rel)
+	diff, err := gitDiffContext(r.Context(), s.ix.Root(), rel)
+	if err != nil {
+		fail(w, 503, err.Error())
+		return
+	}
+	added, modified, deleted := gitHunksFromDiff(diff)
 	nz := func(v []int) []int { // marshal as [] not null
 		if v == nil {
 			return []int{}
@@ -766,7 +863,7 @@ func (s *Server) handleDef(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
-	s.ix.Build()
+	s.ix.BuildContext(r.Context())
 	n, _, ms := s.ix.Stats()
 	writeJSON(w, map[string]any{"files": n, "indexMs": ms})
 }
@@ -834,4 +931,3 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, "method not allowed")
 	}
 }
-

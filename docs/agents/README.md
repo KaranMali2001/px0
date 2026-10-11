@@ -5,9 +5,9 @@ This document defines critical instructions, architectural principles, and docum
 ## 1. Core Architectural Tenets
 
 1. Edits Go Through a Harness, Never Through px0: px0 does not author, format, or save changes to project files, and reads stay its hot path. The optional agent flow ([`agent.go`](../../agent.go)) composes an instruction anchored to a line range and hands it to a coding harness already installed on the machine; that harness performs the write, and px0 reloads what moved once it exits. Several harnesses can be dispatched at once, one per non-overlapping line range: `agentManager` refuses a dispatch that overlaps a range still running. Do not introduce file modification or editor save APIs that take content from the client.
-1. Zero Runtime and Single Binary Footprint: Any change must compile into a single static binary (`go:embed` for web assets). Do not introduce runtime dependencies (no Node.js/npm runtime requirement, no external database, no CGO dependencies).
-1. Stateless on Disk: px0 leaves zero configuration or temporary cache artifacts on the user filesystem (no local `.px0/` folders or cache files). Edit instructions are held in memory for the life of the process and are never persisted, so there is no review or comment store to migrate. The only writes to a working tree are those made by a dispatched harness.
-1. Performance Budgets: Indexing must complete in milliseconds using bounded concurrency (`NumCPU * 4`). File open must remain $O(1)$ relative to file length using windowed chunking (`hlChunk = 1000`) and browser DOM virtualization. Maintain explicit memory reclamation (`debug.FreeOSMemory()` on idle).
+1. Zero Runtime and Single Binary Footprint: Any change must compile into a single static binary (`go:embed` for web assets). Do not introduce runtime dependencies (no Node.js/npm runtime requirement, no external database). CLI releases support `CGO_ENABLED=0`; the optional macOS desktop target uses CGO, Wails, and system Cocoa/WebKit frameworks. macOS RSS sampling uses the system `/bin/ps` command.
+1. Stateless in the Workspace: px0 leaves no configuration or cache artifacts in the project. User preferences, harness choice, update/telemetry state, and the desktop last-folder record live in the user configuration directory (`~/.px0/` or `$XDG_CONFIG_HOME/px0/`). Edit instructions are held in memory for the life of the process and are never persisted, so there is no review or comment store to migrate. The only writes to a working tree are those made by a dispatched harness.
+1. Performance Budgets: Indexing uses bounded concurrency (`NumCPU * 4`) and cancellation. Cold file open reads the source and builds an exact line table, so it is O(file size), capped at 64 MiB; highlighting uses byte-bounded windows (`hlChunk = 1000`). Source DOM is viewport-bounded; trees/diffs use pages and browser chunks use an LRU budget. Validate performance claims with measurements. Maintain explicit memory reclamation (`debug.FreeOSMemory()` on idle).
 
 ## 2. Mandatory Documentation Maintenance Protocol
 
@@ -34,7 +34,7 @@ Whenever modifying, adding, or refactoring code in this repository, you must aud
 
 ## 3. Checklist for Agents Prior to Submitting Work
 
-- Verification: Ran `go test ./...` and confirmed all unit/regression tests pass (`ok px0`).
+- Verification: Obtain explicit approval for exact test commands under AGENTS.md; after approval run `go test ./...` and confirm all unit/regression tests pass (`ok px0`).
 - Build Integrity: Verified successful build with `go build -o px0 .`.
 - Web Bundling: If modifying `web/src/`, verified bundle update with `./scripts/build-web.js`.
 - Architecture Sync: Any new optimization, algorithmic adjustment, or structural change is documented in the corresponding [`docs/internals/`](../internals/README.md) write-up.

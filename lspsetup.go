@@ -122,8 +122,10 @@ func (m *lspManager) Rescan() {
 	}
 	m.discover()
 	m.mu.Lock()
-	m.failed = map[string]string{}
-	m.restarts = nil
+	if !m.closed {
+		m.failed = map[string]string{}
+		m.restarts = nil
+	}
 	m.mu.Unlock()
 }
 
@@ -184,9 +186,15 @@ func (m *lspManager) Install(name string, option int) (*lspJob, error) {
 		return nil, fmt.Errorf("%s is not installed", in.Cmd[0])
 	}
 
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, context.Canceled
+	}
 	m.jobMu.Lock()
 	if j := m.jobs[name]; j != nil && j.Running {
 		m.jobMu.Unlock()
+		m.mu.Unlock()
 		return m.job(name), nil
 	}
 	j := &lspJob{Server: name, Cmd: strings.Join(in.Cmd, " "), Running: true, out: &tailBuffer{max: 16 << 10}}
@@ -194,16 +202,26 @@ func (m *lspManager) Install(name string, option int) (*lspJob, error) {
 		m.jobs = map[string]*lspJob{}
 	}
 	m.jobs[name] = j
+	m.spawns.Add(1)
 	m.jobMu.Unlock()
+	m.mu.Unlock()
 
 	go m.runInstall(def, j, tool, in.Cmd[1:])
 	return m.job(name), nil
 }
 
 func (m *lspManager) runInstall(def *lspServerDef, j *lspJob, tool string, args []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), lspInstallTimeout)
+	defer m.spawns.Done()
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, lspInstallTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, tool, args...)
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error { return killCommand(cmd) }
+	cmd.WaitDelay = 500 * time.Millisecond
 	// Outside the workspace, so its go.mod or package.json cannot change what is installed.
 	if home, err := os.UserHomeDir(); err == nil {
 		cmd.Dir = home
@@ -211,7 +229,12 @@ func (m *lspManager) runInstall(def *lspServerDef, j *lspJob, tool string, args 
 	cmd.Stdout, cmd.Stderr = j.out, j.out // stdin stays empty: a prompt fails instead of hanging
 
 	err := cmd.Run()
+	if cmd.Process != nil {
+		killCommand(cmd)
+	}
 	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		err = ctx.Err()
 	case ctx.Err() != nil:
 		err = fmt.Errorf("gave up after %s", lspInstallTimeout)
 	case err == nil:
@@ -270,6 +293,9 @@ func localPost(w http.ResponseWriter, r *http.Request) bool {
 		host = h
 	}
 	host = strings.Trim(host, "[]")
+	if isTrustedDesktopRequest(r) {
+		return true
+	}
 	if host != "localhost" && net.ParseIP(host) == nil {
 		fail(w, http.StatusForbidden, "open px0 by IP address or localhost to set up language servers")
 		return false

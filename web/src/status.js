@@ -105,22 +105,23 @@ export function drawLspStatus() {
 
 const metricsMenuEl = $('#metrics-menu');
 let lastMetrics = null;
+let metricsTimer = 0;
 
 function renderMetricsMenu(m) {
   if (!metricsMenuEl || !m) return;
   metricsMenuEl.innerHTML = `
     <div class="metrics-title">
-      <span>Process Metrics</span>
+      <span>px0 process (excludes child processes)</span>
       <span class="toast-chip">px0</span>
     </div>
     <div class="metrics-grid">
       <div class="metrics-row">
         <span class="metrics-label">Resident RAM (RSS)</span>
-        <span class="metrics-val">${fmtBytes(m.rssBytes)}</span>
+        <span class="metrics-val">${m.rssAvailable ? fmtBytes(m.rssBytes) : 'Unavailable'}</span>
       </div>
       <div class="metrics-row">
         <span class="metrics-label">CPU Usage</span>
-        <span class="metrics-val">${m.cpuUsage.toFixed(1)}%</span>
+        <span class="metrics-val">${m.cpuAvailable ? m.cpuUsage.toFixed(1) + '%' : 'Unavailable'}</span>
       </div>
       <div class="metrics-row">
         <span class="metrics-label">Active Goroutines</span>
@@ -160,8 +161,8 @@ export function updateMetricsDisplay(m) {
   lastMetrics = m;
   const cpuEl = $('#st-cpu');
   const ramEl = $('#st-ram');
-  if (cpuEl) cpuEl.textContent = `${m.cpuUsage.toFixed(1)}%`;
-  if (ramEl) ramEl.textContent = fmtBytes(m.rssBytes);
+  if (cpuEl) cpuEl.textContent = m.cpuAvailable ? `${m.cpuUsage.toFixed(1)}%` : '—';
+  if (ramEl) ramEl.textContent = m.rssAvailable ? fmtBytes(m.rssBytes) : '—';
   if (metricsMenuEl && !metricsMenuEl.hidden) {
     renderMetricsMenu(m);
     placeMetricsMenu();
@@ -173,6 +174,15 @@ export async function refreshMetrics() {
     const m = await api('/api/metrics');
     updateMetricsDisplay(m);
   } catch {}
+}
+
+function scheduleMetrics() {
+  clearTimeout(metricsTimer);
+  if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
+  metricsTimer = setTimeout(async () => {
+    await refreshMetrics();
+    scheduleMetrics();
+  }, 5000);
 }
 
 export function initMetrics() {
@@ -196,8 +206,11 @@ export function initMetrics() {
     if (e.key === 'Escape') closeMetricsMenu();
   });
 
+  addEventListener('focus', () => { refreshMetrics(); scheduleMetrics(); });
+  addEventListener('blur', scheduleMetrics);
+  document.addEventListener('visibilitychange', scheduleMetrics);
   refreshMetrics();
-  setInterval(refreshMetrics, 2500);
+  scheduleMetrics();
 }
 
 /* The status bar stays on one line. When its contents outgrow the width, it

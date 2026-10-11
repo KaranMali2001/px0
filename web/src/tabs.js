@@ -2,6 +2,7 @@
 import { $, esc, S, doc_, api, LH, CHUNK, withKeys } from './state.js';
 import { vp, sizer, rowsEl, editor } from './ui.js';
 import { render, layout, refineChunk } from './renderer.js';
+import { storeChunk } from './chunkcache.js';
 import { updateStatus, setStatusNote, refreshMetrics } from './status.js';
 import { pushHistory } from './history.js';
 import { warmLSP } from './lsp.js';
@@ -22,34 +23,34 @@ const MAX_CLOSED = 20;
 export async function openFile(path, opts = {}) {
   const { line, push = true, col } = opts;
   let idx = S.tabs.findIndex(t => t.path === path);
+  console.info('[px0 open] start', { path, cached: idx >= 0, line });
   if (idx < 0) {
     let j;
     const start = line ? Math.max(0, Math.floor((line - 1) / CHUNK) * CHUNK) : 0;
     try {
       j = await api('/api/file', { path, start, count: CHUNK });
+      console.info('[px0 open] loaded', { path, total: j.total, image: !!j.image });
     } catch (e) {
+      console.error('[px0 open] failed', { path, error: e.message });
       setStatusNote(path + ': ' + e.message, 4000);
-      return;
+      return false;
     }
     const isImg = !!j.image;
-    const hasDiff = !isImg && !!j.diffAvailable;
     const d = {
       path, name: path.split('/').pop(), lang: isImg ? 'image' : j.lang,
       total: isImg ? 0 : j.total, maxCols: isImg ? 0 : j.maxCols,
-      size: j.size, lines: isImg ? [] : new Array(j.total),
+      size: j.size, lines: Object.create(null),
       chunks: new Set(isImg ? [] : [start / CHUNK]),
       pending: new Set(), refining: new Set(), scrollTop: 0, cur: line || 1,
       outline: null, gen: 0, markdown: !isImg && !!j.markdown, isImage: isImg,
       gutter: null,
-      diffMode: hasDiff ? (layoutPref() || 'split') : null,
-      diffAvailable: hasDiff,
+      diffMode: null,
+      diffAvailable: false,
       diffDismissed: false,
     };
-    if (!isImg) {
-      for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
-    }
     d.lsp = (!isImg && j.lsp) || { state: 'off', server: '' };
     S.tabs.push(d);
+    if (!isImg) storeChunk(d, j);
     idx = S.tabs.length - 1;
     if (!isImg && j.refine) refineChunk(d, start / CHUNK);
     if (!isImg) loadGutter(d);
@@ -77,6 +78,8 @@ export async function openFile(path, opts = {}) {
   updateStatus();
   if ($('#panel-outline')?.classList.contains('active')) loadOutline();
   if (push) pushHistory(path, line || d.cur, col);
+  console.info('[px0 open] active', { path: d.path, tabs: S.tabs.length });
+  return true;
 }
 
 // VS Code-style diff gutter for the normal file view. Fetches once per opened
@@ -87,6 +90,7 @@ export async function openFile(path, opts = {}) {
 function loadGutter(d) {
   if (!S.meta?.git) return;
   api('/api/gutter', { path: d.path }).then(j => {
+    if (!S.tabs.includes(d)) return;
     d.diffAvailable = !!j.available;
     if (j.available && d.diffMode === null && !d.diffDismissed) {
       d.diffMode = layoutPref() || 'split';
@@ -96,7 +100,12 @@ function loadGutter(d) {
       }
     }
     if (doc_() === d) updateStatus();
-    if (!j.available) return;
+    if (!j.available) {
+      d.gutter = null;
+      d.diffMode = null;
+      if (doc_() === d) { syncDiffView(); syncPreview(); render(); }
+      return;
+    }
     const marks = new Map();
     for (const n of j.modified) marks.set(n, 'mod');
     for (const n of j.added) marks.set(n, 'add');
@@ -150,7 +159,7 @@ export async function reloadOpenTabs() {
     }
 
     const keep = tgt.oldDoc;
-    const hasDiff = !!j.diffAvailable;
+    const hasDiff = keep.diffAvailable;
     const newCur = Math.max(1, Math.min(keep.cur || 1, j.total));
 
     /* A reload keeps each tab in the view it was in. The file changing under
@@ -165,7 +174,7 @@ export async function reloadOpenTabs() {
       total: j.total,
       maxCols: j.maxCols,
       size: j.size,
-      lines: new Array(j.total),
+      lines: Object.create(null),
       chunks: new Set([tgt.start / CHUNK]),
       pending: new Set(),
       refining: new Set(),
@@ -183,12 +192,10 @@ export async function reloadOpenTabs() {
       diffScroll: keep === activeDoc && keep.diffMode ? diffScrollTop() : 0,
     };
 
-    for (let k = 0; k < j.lines.length; k++) {
-      d.lines[j.start + k] = j.lines[k];
-    }
     d.lsp = j.lsp || { state: 'off', server: '' };
 
     S.tabs[idx] = d;
+    storeChunk(d, j);
     if (j.refine) refineChunk(d, tgt.start / CHUNK);
     loadGutter(d);
   }
@@ -235,9 +242,13 @@ export function closeTab(i) {
     // Release large arrays to assist garbage collection
     closed.lines = null;
     closed.chunks?.clear?.();
+    closed.chunkCache?.clear?.();
     closed.pending?.clear?.();
     closed.refining?.clear?.();
     closed.outline = null;
+    closed.diffHunks = null;
+    closed.diffText = null;
+    closed.gutter = null;
   }
   if (S.tabs.length === 0) {
     S.active = -1;

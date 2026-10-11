@@ -110,7 +110,9 @@ func newTestServer(t *testing.T) (*Server, string) {
 
 	ix := NewIndex(root)
 	ix.Build()
-	return NewServer(ix, nil), root
+	s := NewServer(ix, nil)
+	t.Cleanup(s.Close)
+	return s, root
 }
 
 func get(t *testing.T, s *Server, url string) (int, map[string]any) {
