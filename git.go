@@ -26,9 +26,16 @@ type gitInfo struct {
 }
 
 var (
-	gitMu    sync.Mutex
-	gitCache = map[string]gitInfo{}
+	gitMu       sync.Mutex
+	gitCache    = map[string]gitInfo{}
+	gitTimedOut = map[string]time.Time{} // root -> when a timed-out probe may run again
+	gitInflight = map[string]chan struct{}{}
 )
+
+// gitTimeoutTTL is how long a timed-out probe answers "not git" without
+// re-running, so the many gitAvailable callers don't each stall behind a
+// pending macOS TCC prompt. GitWatcher retries on its own schedule.
+var gitTimeoutTTL = 30 * time.Second
 
 // gitQueryTimeout bounds the git queries run while a workspace opens. A child
 // git can block indefinitely (e.g. macOS TCC gating a privacy-protected folder
@@ -55,42 +62,84 @@ func gitAvailable(root string) bool { return gitProbe(root).ok }
 // gitDir returns the absolute path to the repository's .git directory.
 func gitDir(root string) string { return gitProbe(root).gitdir }
 
-func gitProbe(root string) gitInfo {
+func gitProbe(root string) gitInfo { return probeGit(root, false) }
+
+// gitProbeTimedOut reports whether root's last probe timed out rather than
+// answering, so a "not git" for it may still change.
+func gitProbeTimedOut(root string) bool {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	_, ok := gitTimedOut[root]
+	return ok
+}
+
+// probeGit runs the probe outside gitMu, one per root at a time; force
+// ignores a recent timeout. Callers wait at most for one in-flight probe.
+func probeGit(root string, force bool) gitInfo {
 	if gitDisabled {
 		return gitInfo{}
 	}
-	gitMu.Lock()
-	defer gitMu.Unlock()
-	if info, ok := gitCache[root]; ok {
+	for {
+		gitMu.Lock()
+		if info, ok := gitCache[root]; ok {
+			gitMu.Unlock()
+			return info
+		}
+		if until, ok := gitTimedOut[root]; ok && !force && time.Now().Before(until) {
+			gitMu.Unlock()
+			return gitInfo{}
+		}
+		if ch, ok := gitInflight[root]; ok {
+			gitMu.Unlock()
+			<-ch
+			force = false
+			continue
+		}
+		ch := make(chan struct{})
+		gitInflight[root] = ch
+		gitMu.Unlock()
+
+		info, timedOut := runGitProbe(root)
+
+		gitMu.Lock()
+		delete(gitInflight, root)
+		close(ch)
+		// A timeout (e.g. a pending macOS TCC prompt) is not an answer; retry later.
+		if timedOut {
+			gitTimedOut[root] = time.Now().Add(gitTimeoutTTL)
+			info = gitInfo{}
+		} else {
+			delete(gitTimedOut, root)
+			gitCache[root] = info
+		}
+		gitMu.Unlock()
 		return info
 	}
-	var info gitInfo
-	timedOut := false
-	if _, err := exec.LookPath("git"); err == nil {
-		out, err := gitQuery("-C", root, "rev-parse", "--show-toplevel")
-		timedOut = errors.Is(err, context.DeadlineExceeded)
-		if err == nil {
-			top := strings.TrimSpace(string(out))
-			gd := filepath.Join(top, ".git")
-			gdOut, err := gitQuery("-C", root, "rev-parse", "--git-dir")
-			timedOut = errors.Is(err, context.DeadlineExceeded)
-			if err == nil {
-				rawGd := strings.TrimSpace(string(gdOut))
-				if filepath.IsAbs(rawGd) {
-					gd = rawGd
-				} else {
-					gd = filepath.Join(top, rawGd)
-				}
-			}
-			info = gitInfo{ok: true, toplevel: top, gitdir: gd}
+}
+
+func runGitProbe(root string) (info gitInfo, timedOut bool) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return info, false
+	}
+	out, err := gitQuery("-C", root, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return info, errors.Is(err, context.DeadlineExceeded)
+	}
+	top := strings.TrimSpace(string(out))
+	gd := filepath.Join(top, ".git")
+	gdOut, err := gitQuery("-C", root, "rev-parse", "--git-dir")
+	if errors.Is(err, context.DeadlineExceeded) {
+		return gitInfo{}, true
+	}
+	if err == nil {
+		rawGd := strings.TrimSpace(string(gdOut))
+		if filepath.IsAbs(rawGd) {
+			gd = rawGd
+		} else {
+			gd = filepath.Join(top, rawGd)
 		}
 	}
-	// A timeout (e.g. a pending macOS TCC prompt) is not an answer; retry next time.
-	if timedOut {
-		return gitInfo{}
-	}
-	gitCache[root] = info
-	return info
+	return gitInfo{ok: true, toplevel: top, gitdir: gd}, false
 }
 
 // gitStatus maps repo-relative-to-served-root path -> single-letter status for

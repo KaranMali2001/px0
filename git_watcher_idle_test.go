@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -255,5 +256,93 @@ func TestIdlePolicyForegroundChangeLatency(t *testing.T) {
 		case <-deadline:
 			t.Fatal("foreground change did not reach the client within 1.5s")
 		}
+	}
+}
+
+func TestGitWatcherRetriesTimedOutStart(t *testing.T) {
+	if !gitInstalled() {
+		t.Skip("git not installed")
+	}
+	root := gitRepo(t)
+	gitMu.Lock()
+	gitTimedOut[root] = time.Now().Add(time.Hour)
+	gitMu.Unlock()
+	t.Cleanup(func() {
+		gitMu.Lock()
+		delete(gitTimedOut, root)
+		gitMu.Unlock()
+	})
+
+	var mu sync.Mutex
+	var delays []time.Duration
+	fired := make(chan time.Time)
+	close(fired)
+	oldAfter, oldProbe := gitWatchAfter, gitWatchProbe
+	gitWatchAfter = func(d time.Duration) <-chan time.Time {
+		mu.Lock()
+		delays = append(delays, d)
+		mu.Unlock()
+		return fired
+	}
+	calls := 0
+	probed := make(chan struct{})
+	gitWatchProbe = func(r string) bool {
+		if calls++; calls < 6 {
+			return false
+		}
+		defer close(probed)
+		return probeGit(r, true).ok
+	}
+	t.Cleanup(func() { gitWatchAfter, gitWatchProbe = oldAfter, oldProbe })
+
+	gw := NewGitWatcher(NewIndex(root))
+	gw.Start(t.Context())
+	<-probed
+	gw.Stop()
+	select {
+	case <-gw.loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher loop never started after the probe succeeded")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	s := time.Second
+	want := []time.Duration{2 * s, 5 * s, 10 * s, 30 * s, 30 * s, 30 * s}
+	if len(delays) != len(want) {
+		t.Fatalf("delays = %v, want %v", delays, want)
+	}
+	for i := range want {
+		if delays[i] != want[i] {
+			t.Fatalf("delays = %v, want %v", delays, want)
+		}
+	}
+}
+
+func TestGitWatcherRetryStopsOnClose(t *testing.T) {
+	root := t.TempDir()
+	gitMu.Lock()
+	gitTimedOut[root] = time.Now().Add(time.Hour)
+	gitMu.Unlock()
+	t.Cleanup(func() {
+		gitMu.Lock()
+		delete(gitTimedOut, root)
+		gitMu.Unlock()
+	})
+	oldAfter, oldProbe := gitWatchAfter, gitWatchProbe
+	never := make(chan time.Time)
+	asked := make(chan struct{}, 8)
+	gitWatchAfter = func(time.Duration) <-chan time.Time { asked <- struct{}{}; return never }
+	gitWatchProbe = func(string) bool { t.Error("probe after Stop"); return false }
+	t.Cleanup(func() { gitWatchAfter, gitWatchProbe = oldAfter, oldProbe })
+
+	gw := NewGitWatcher(NewIndex(root))
+	gw.Start(t.Context())
+	<-asked
+	gw.Stop()
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-gw.loopDone:
+		t.Fatal("retry must stop without starting the loop")
+	default:
 	}
 }

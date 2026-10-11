@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1971,4 +1972,32 @@ func TestStartupGitQueriesAreBounded(t *testing.T) {
 	if cached {
 		t.Fatal("timed-out probe was cached as not-a-repo")
 	}
+
+	// Callers queued behind a pending probe wait for that one probe only,
+	// and later callers get the remembered timeout without re-running git.
+	root2 := t.TempDir()
+	start = time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gitAvailable(root2)
+		}()
+	}
+	wg.Wait()
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("8 concurrent probes took %v, want one probe's worth", d)
+	}
+	start = time.Now()
+	if gitAvailable(root2) || !gitProbeTimedOut(root2) {
+		t.Fatal("timed-out root must read as not git, pending retry")
+	}
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Fatalf("re-probe within gitTimeoutTTL took %v", d)
+	}
+	gitMu.Lock()
+	delete(gitTimedOut, root)
+	delete(gitTimedOut, root2)
+	gitMu.Unlock()
 }

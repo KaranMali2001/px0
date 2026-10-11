@@ -80,10 +80,49 @@ func NewGitWatcher(ix *Index) *GitWatcher {
 
 // Start begins the background monitoring goroutine.
 func (gw *GitWatcher) Start(ctx context.Context) {
-	if gitDisabled || !gitAvailable(gw.root) {
+	if gitDisabled {
 		return
 	}
+	if !gitAvailable(gw.root) {
+		if gitProbeTimedOut(gw.root) {
+			go gw.retryStart(ctx)
+		}
+		return
+	}
+	gw.run(ctx)
+}
 
+// Backoff for re-probing a root whose first probe timed out, e.g. while a
+// macOS folder-access prompt is pending; the last delay repeats.
+var (
+	gitWatchRetry = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second}
+	gitWatchAfter = time.After
+	gitWatchProbe = func(root string) bool { return probeGit(root, true).ok }
+)
+
+// retryStart starts the loop once the user grants access, so live git
+// status resumes without reopening the folder.
+func (gw *GitWatcher) retryStart(ctx context.Context) {
+	for i := 0; ; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-gw.stopCh:
+			return
+		case <-gitWatchAfter(gitWatchRetry[min(i, len(gitWatchRetry)-1)]):
+		}
+		if gitWatchProbe(gw.root) {
+			gw.run(ctx)
+			gw.Trigger()
+			return
+		}
+		if !gitProbeTimedOut(gw.root) {
+			return
+		}
+	}
+}
+
+func (gw *GitWatcher) run(ctx context.Context) {
 	gitdir := gitDir(gw.root)
 	gw.recordGitMeta(gitdir)
 
