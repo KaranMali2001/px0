@@ -93,6 +93,7 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - R3-5: the empty-tab-bar drag strip is scoped to `html.desktop body:is(.side-right, .side-hidden) #tabs:empty`; with the sidebar on the left its header already holds the traffic lights and drag area, so the no-tabs state matches upstream.
 - R3-8: `openAfterStartup` serializes opens with `deskHandler.openMu`, so two quick Open Recent / Open Folder picks install and `rememberFolder` one after another (`TestDeskHandlerSerializesUserOpens`).
 - R3-4: the `px0:menu` comment in `web/src/shortcuts.js` now says WKWebView gives the page key equivalents first; the menu callback serves clicks only.
+- R3-2: `restoreWindow` clamps the saved frame with `clampWindowState` before `WindowSetSize`/`WindowSetPosition`; under 100x100 px of overlap it falls back to 1200x800 (capped to the screen) and `WindowCenter` (`TestClampWindowState`). It clamps to the *current* screen, not the union of screens: Wails 2.16 `Screen` has only sizes, no origins, and `WindowSetPosition` is relative to the current screen's `visibleFrame` (`WailsContext.m:69-80`), so a frame saved on a secondary display reopens on the current one. Runtime multi-monitor behaviour is unverified.
 
 ## Uncertain / follow-ups
 

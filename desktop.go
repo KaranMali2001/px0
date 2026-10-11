@@ -97,7 +97,7 @@ func main() {
 			enableHighRefreshRate()
 			deskCtx.Store(&ctx)
 			if hasWin {
-				wruntime.WindowSetPosition(ctx, win.X, win.Y)
+				restoreWindow(ctx, win)
 			}
 			addSettingsMenuItem()
 			go func() {
@@ -276,6 +276,42 @@ func loadWindowState() (windowState, bool) {
 	if err != nil || json.Unmarshal(b, &s) != nil || s.W < 600 || s.H < 400 {
 		return windowState{}, false
 	}
+	return s, true
+}
+
+// restoreWindow clamps the saved frame to the current screen: Wails positions
+// relative to the current screen's visible frame and reports no screen
+// origins, so a frame saved on an unplugged or secondary display could
+// otherwise land off-screen.
+func restoreWindow(ctx context.Context, win windowState) {
+	screens, err := wruntime.ScreenGetAll(ctx)
+	if err != nil || len(screens) == 0 {
+		return
+	}
+	scr := screens[0]
+	for _, s := range screens {
+		if s.IsCurrent {
+			scr = s
+		}
+	}
+	if fit, ok := clampWindowState(win, scr.Size.Width, scr.Size.Height); ok {
+		wruntime.WindowSetSize(ctx, fit.W, fit.H)
+		wruntime.WindowSetPosition(ctx, fit.X, fit.Y)
+	} else {
+		wruntime.WindowSetSize(ctx, min(1200, scr.Size.Width), min(800, scr.Size.Height))
+		wruntime.WindowCenter(ctx)
+	}
+}
+
+// clampWindowState fits s inside a sw x sh screen. It reports false when s
+// overlaps the screen by less than 100x100 px, so the caller uses the default.
+func clampWindowState(s windowState, sw, sh int) (windowState, bool) {
+	if min(s.X+s.W, sw)-max(s.X, 0) < 100 || min(s.Y+s.H, sh)-max(s.Y, 0) < 100 {
+		return windowState{}, false
+	}
+	s.W, s.H = min(s.W, sw), min(s.H, sh)
+	s.X = max(0, min(s.X, sw-s.W))
+	s.Y = max(0, min(s.Y, sh-s.H))
 	return s, true
 }
 

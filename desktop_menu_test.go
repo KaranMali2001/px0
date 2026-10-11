@@ -63,6 +63,25 @@ func TestWindowStateRoundTripRejectsTooSmall(t *testing.T) {
 	}
 }
 
+func TestClampWindowState(t *testing.T) {
+	for _, c := range []struct {
+		in, want windowState
+		ok       bool
+	}{
+		{windowState{40, 60, 1000, 700}, windowState{40, 60, 1000, 700}, true},
+		{windowState{1000, 150, 1200, 800}, windowState{240, 100, 1200, 800}, true},
+		{windowState{-300, -50, 1200, 800}, windowState{0, 0, 1200, 800}, true},
+		{windowState{100, 100, 3000, 2000}, windowState{0, 0, 1440, 900}, true},
+		{windowState{3000, 100, 1200, 800}, windowState{}, false},
+		{windowState{1350, 100, 1200, 800}, windowState{}, false},
+		{windowState{-1150, 100, 1200, 800}, windowState{}, false},
+	} {
+		if got, ok := clampWindowState(c.in, 1440, 900); got != c.want || ok != c.ok {
+			t.Errorf("clamp(%v) = %v %v, want %v %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
 func TestBuildMenuWiring(t *testing.T) {
 	isolateSettings(t)
 	rememberFolder(t.TempDir())
