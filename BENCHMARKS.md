@@ -185,6 +185,19 @@ CORPUS=~/px0-bench-repos ./benchmark-desktop.sh --app      # desktop table only
 
 Keep the corpus outside Desktop, Documents and Downloads. Otherwise macOS asks for folder access on every launch.
 
+**FSEvents watcher, search streaming and launch changes (b8d5e86 vs ceb17a0).** Apple M4, official corpus, language servers off, window in the background. The old and new builds were launched alternately; figures are medians.
+
+| Measure | Repo | Before | After |
+|---|---|---|---|
+| App idle CPU (3 launches) | django / kubernetes / linux | 1.83% / 2.12% / 1.85% | 0.15% / 0.15% / 0.23% |
+| File change → git status pushed (7 runs) | 36-file fixture | 454 ms | 119 ms |
+| App peak footprint after 3 full-tree searches (3 launches) | kubernetes / linux | 121 / 400 MB | 74 / 121 MB |
+| App footprint 30 s later (3 launches) | kubernetes / linux | 95 / 196 MB | 67 / 101 MB |
+| Allocations during 3 linux searches (pprof) | linux | 2.82 GB | 0.22 GB |
+| Launch → ready (5 launches) | flask / django / kubernetes / typescript / linux | 331 / 556 / 710 / 985 / 947 ms | 308 / 575 / 703 / 962 / 888 ms |
+
+Launch time is unchanged within noise: the index walk itself, not contention, dominates. Physical footprint is reported because RSS also counts shared system frameworks and roughly doubles a WebKit app's apparent memory.
+
 ## 7. Memory Scavenging Verification
 
 To observe resident memory scavenging in real time, run:
