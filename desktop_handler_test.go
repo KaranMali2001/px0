@@ -109,18 +109,38 @@ func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 	if strings.Contains(desk, "https://px0.ai/favicon") || strings.Contains(desk, "https://px0.ai/logo/") || strings.Contains(desk, "fonts.googleapis.com") || strings.Contains(desk, "fonts.gstatic.com") {
 		t.Fatal("desktop index still loads remote fonts/favicons/logos")
 	}
-	if css := get(httptest.NewRequest(http.MethodGet, "/static/static/fonts/fonts.css", nil)); !strings.Contains(css, "JetBrainsMono-Regular.woff2") {
+	css := get(httptest.NewRequest(http.MethodGet, "/static/static/fonts/fonts.css", nil))
+	urls := regexp.MustCompile(`url\('([^']+)'\)`).FindAllStringSubmatch(css, -1)
+	if len(urls) == 0 {
 		t.Fatal("bundled font stylesheet not served")
+	}
+	for _, url := range urls {
+		if font := get(httptest.NewRequest(http.MethodGet, "/static/static/fonts/"+url[1], nil)); !strings.HasPrefix(font, "wOF2") {
+			t.Fatalf("bundled font %s not served", url[1])
+		}
+	}
+	if !strings.Contains(css, "font-weight: 600") {
+		t.Fatal("bundled fonts miss upstream's 600 weight")
 	}
 
 	if err := os.MkdirAll(filepath.Join(cfg, "px0"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cfg, "px0", "settings.json"), []byte(`{"desktop.nativeStyling": false}`), 0o644); err != nil {
+	if strings.Contains(desk, "side-right") {
+		t.Fatal("default desktop index marks body.side-right")
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "px0", "settings.json"), []byte(`{"desktop.nativeStyling": false, "workbench.sideBar.location": "right"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if desk := get(trustedDesktopRequest(httptest.NewRequest(http.MethodGet, "/", nil))); !strings.Contains(desk, `<html class="desktop" lang="en"`) {
+	desk = get(trustedDesktopRequest(httptest.NewRequest(http.MethodGet, "/", nil)))
+	if !strings.Contains(desk, `<html class="desktop" lang="en"`) {
 		t.Fatal("desktop.nativeStyling=false still marks html.native")
+	}
+	if !strings.Contains(desk, `<body class="side-right">`) {
+		t.Fatal("right sidebar setting not applied to desktop index body")
+	}
+	if cli := get(httptest.NewRequest(http.MethodGet, "/", nil)); cli != string(upstream) {
+		t.Fatal("CLI index changed by desktop settings")
 	}
 }
 

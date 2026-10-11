@@ -83,8 +83,10 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - N7: `desktopIndex` also drops the two Google Fonts `preconnect` links, so the desktop page opens no connection to Google.
 - N3: `handleEventStream` (`/api/stream`, `/api/git/stream`) and `handleThreadStream` return on `s.done`, so a closed server's streams stop ticking even when the request context never ends (Wails) (`TestStreamHandlersExitOnClose`).
 - N9: `TestServerCloseIdempotentStopsWatcher` git-inits its root and waits on `GitWatcher.loopDone`, which the loop goroutine closes on exit; `make test-desktop` runs `go test -race -tags desktop ./...`.
+- Q2: `desktopIndex` writes `<body class="side-right">` when `workbench.sideBar.location` is `right`, so right-sidebar users get no left-to-right relayout flash; the CLI index is unchanged (`TestIndexDesktopMarkerOnlyForDesktopRequests`).
+- Item 9: the bundled fonts are the exact latin-subset files Google Fonts serves for upstream's css2 URL (JetBrains Mono v24): one upright variable file used for 400/500/600 and one 400 italic file, with Google's `unicode-range`. `OFL.txt` sits next to them in `web/static/fonts/`. The old 400/400i/500/700 files are gone. Upright came from a Safari UA request, italic from a Chrome UA request, because Safari is served the italic as woff.
 
 ## Uncertain / follow-ups
 
 - `.gitignore` from upstream ignores `build/`. The tracked `build/darwin/*` and `build/appicon.png` stay tracked, but new files there need `git add -f`.
-- Desktop loads only the bundled JetBrains Mono (400, 400 italic, 500, 700); upstream's Google Fonts request asks for 600 instead of 700, so desktop semibold text uses the nearest bundled weight.
+- Desktop bundles only the latin subset, so non-latin code text falls back to system fonts where the web build would load Google's cyrillic/greek/vietnamese/latin-ext subsets.

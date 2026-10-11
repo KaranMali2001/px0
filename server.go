@@ -647,7 +647,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		html = baseTag + "\n" + html
 	}
 	if isTrustedDesktopRequest(r) {
-		html = desktopIndex(html, readMergedSettingsMap()["desktop.nativeStyling"] != false)
+		settings := readMergedSettingsMap()
+		html = desktopIndex(html, settings["desktop.nativeStyling"] != false, settings["workbench.sideBar.location"] == "right")
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, html)
@@ -678,12 +679,19 @@ var desktopSettingsSchema = []settingSchemaItem{
 // desktopIndex marks the page for html.desktop CSS/JS and points remote
 // fonts, favicons and logos at the embedded copies so the app works offline.
 // native adds html.native, which gates every desktop.nativeStyling refinement.
-func desktopIndex(html string, native bool) string {
+// sideRight sets body.side-right up front so right-sidebar users don't see the
+// left layout flash before settings load.
+func desktopIndex(html string, native, sideRight bool) string {
 	class := "desktop"
 	if native {
 		class += " native"
 	}
+	body := "<body>"
+	if sideRight {
+		body = `<body class="side-right">`
+	}
 	return strings.NewReplacer(
+		"<body>", body,
 		`<html lang="en"`, `<html class="`+class+`" lang="en"`,
 		`"https://px0.ai/favicon`, `"static/static/favicon`,
 		`"https://px0.ai/logo/`, `"static/static/logo/`,
