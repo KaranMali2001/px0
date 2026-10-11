@@ -1,4 +1,4 @@
-.PHONY: all build web test dist publish clean help desktop dmg install-cli install-desktop install-local
+.PHONY: all build web test test-desktop dist publish clean help desktop dmg install-cli install-desktop install-local
 
 VERSION ?= $(shell cat VERSION 2>/dev/null | tr -d ' \r\n')
 # Support 'make publish 0.2.0' where target argument is passed as next goal
@@ -29,6 +29,7 @@ help:
 	@echo "  make web               - bundle web assets (JS/CSS/themes)"
 	@echo "  make test              - run go test suite"
 	@echo "  make test-short        - run fast unit tests (short mode)"
+	@echo "  make test-desktop      - run all tests with -race and the desktop tag"
 	@echo "  make check             - bundle web assets and run fast test suite"
 	@echo "  make dist              - compile cross-platform binaries into dist/"
 	@echo "  make publish <version> - bump VERSION, commit, tag, and build dist binaries"
@@ -56,6 +57,9 @@ web-check:
 
 test-short:
 	go test -short .
+
+test-desktop: web
+	go test -race -tags desktop ./...
 
 check: web-check web test-short
 

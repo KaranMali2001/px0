@@ -81,6 +81,8 @@ Desktop detection: `Server.handleIndex` calls `desktopIndex` only for requests m
 - N1: `gitQuery` returns `ctx.Err()` on timeout; `gitProbe` skips `gitCache` when either query hit `context.DeadlineExceeded` (`TestStartupGitQueriesAreBounded`).
 - N2: `lspManager.Close` latches `closed`; `client`/`StartServer` return `errStopped` and a spawn finishing after Close shuts its child down (`TestManagerCloseLatches`).
 - N7: `desktopIndex` also drops the two Google Fonts `preconnect` links, so the desktop page opens no connection to Google.
+- N3: `handleEventStream` (`/api/stream`, `/api/git/stream`) and `handleThreadStream` return on `s.done`, so a closed server's streams stop ticking even when the request context never ends (Wails) (`TestStreamHandlersExitOnClose`).
+- N9: `TestServerCloseIdempotentStopsWatcher` git-inits its root and waits on `GitWatcher.loopDone`, which the loop goroutine closes on exit; `make test-desktop` runs `go test -race -tags desktop ./...`.
 
 ## Uncertain / follow-ups
 

@@ -46,6 +46,7 @@ type GitWatcher struct {
 
 	triggerCh chan struct{}
 	stopCh    chan struct{}
+	loopDone  chan struct{}
 	// idleCh hands the running loop an idle policy (desktop only); idle is
 	// the installed one, so SetForeground can reach it.
 	idleCh chan *idlePolicy
@@ -68,6 +69,7 @@ func NewGitWatcher(ix *Index) *GitWatcher {
 		clients:        make(map[chan []byte]struct{}),
 		triggerCh:      make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
+		loopDone:       make(chan struct{}),
 		idleCh:         make(chan *idlePolicy, 1),
 		lastHeadCommit: gitHeadCommit(ix.Root()),
 	}
@@ -83,7 +85,10 @@ func (gw *GitWatcher) Start(ctx context.Context) {
 	gitdir := gitDir(gw.root)
 	gw.recordGitMeta(gitdir)
 
-	go gw.loop(ctx, gitdir)
+	go func() {
+		defer close(gw.loopDone)
+		gw.loop(ctx, gitdir)
+	}()
 }
 
 func (gw *GitWatcher) Stop() {

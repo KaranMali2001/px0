@@ -1237,6 +1237,8 @@ func (s *Server) handleThreadStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-s.done:
+			return
 		case ev, open := <-ch:
 			if !open || !write(ev) {
 				return

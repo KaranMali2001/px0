@@ -1514,6 +1514,8 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-s.done:
+			return
 
 		case msg, ok := <-gitCh:
 			if !ok {

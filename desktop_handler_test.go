@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -133,14 +134,48 @@ func isClosed(ch <-chan struct{}) bool {
 }
 
 func TestServerCloseIdempotentStopsWatcher(t *testing.T) {
-	srv := agentServer(t, t.TempDir(), "echo")
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	if out, err := exec.Command("git", "init", root).CombinedOutput(); err != nil {
+		t.Skipf("git init: %v\n%s", err, out)
+	}
+	srv := agentServer(t, root, "echo")
+	if isClosed(srv.gitWatcher.loopDone) {
+		t.Fatal("git watcher loop never ran")
+	}
 	srv.Close()
 	srv.Close()
-	if !isClosed(srv.gitWatcher.stopCh) {
-		t.Fatal("git watcher still running after Close")
+	select {
+	case <-srv.gitWatcher.loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("git watcher loop still running after Close")
 	}
 	if !isClosed(srv.done) {
 		t.Fatal("scavenger not signalled")
+	}
+}
+
+func TestStreamHandlersExitOnClose(t *testing.T) {
+	srv := agentServer(t, t.TempDir(), "echo")
+	streams := map[string]http.HandlerFunc{
+		"/api/stream":         srv.handleEventStream,
+		"/api/git/stream":     srv.handleEventStream,
+		"/api/threads/stream": srv.handleThreadStream,
+	}
+	exited := make(chan string, len(streams))
+	for path, h := range streams {
+		go func() {
+			h(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+			exited <- path
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	srv.Close()
+	for range streams {
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			t.Fatal("stream handler still running after Close")
+		}
 	}
 }
 
