@@ -282,11 +282,11 @@ func TestSidebarLocationSettingOnlyForDesktop(t *testing.T) {
 	}
 
 	cliSchema, cliDefaults := get(false)
-	if has(cliSchema) || cliDefaults["workbench.sideBar.location"] != nil || len(cliSchema) != len(settingsSchema) {
+	if has(cliSchema) || cliDefaults["workbench.sideBar.location"] != nil || cliDefaults["desktop.nativeStyling"] != nil || len(cliSchema) != len(settingsSchema) {
 		t.Fatalf("CLI settings expose desktop-only sidebar location")
 	}
 	deskSchema, deskDefaults := get(true)
-	if !has(deskSchema) || deskDefaults["workbench.sideBar.location"] != "left" {
+	if !has(deskSchema) || deskDefaults["workbench.sideBar.location"] != "left" || deskDefaults["desktop.nativeStyling"] != true {
 		t.Fatalf("desktop settings missing sidebar location: defaults=%v", deskDefaults)
 	}
 	if again, _ := get(false); has(again) {

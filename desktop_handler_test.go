@@ -4,6 +4,8 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -67,6 +69,7 @@ func TestDeskHandlerWaitIsBounded(t *testing.T) {
 
 func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 	srv := agentServer(t, t.TempDir(), "echo")
+	cfg := os.Getenv("XDG_CONFIG_HOME")
 	get := func(r *http.Request) string {
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, r)
@@ -89,8 +92,8 @@ func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 	}
 
 	desk := get(trustedDesktopRequest(httptest.NewRequest(http.MethodGet, "/", nil)))
-	if !strings.Contains(desk, `<html class="desktop" lang="en"`) {
-		t.Fatal("desktop index missing html.desktop marker")
+	if !strings.Contains(desk, `<html class="desktop native" lang="en"`) {
+		t.Fatal("desktop index missing html.desktop.native marker")
 	}
 	for _, tag := range regexp.MustCompile(`<script\b[^>]*>`).FindAllString(desk, -1) {
 		if !strings.Contains(tag, "src=") {
@@ -107,6 +110,16 @@ func TestIndexDesktopMarkerOnlyForDesktopRequests(t *testing.T) {
 	}
 	if css := get(httptest.NewRequest(http.MethodGet, "/static/static/fonts/fonts.css", nil)); !strings.Contains(css, "JetBrainsMono-Regular.woff2") {
 		t.Fatal("bundled font stylesheet not served")
+	}
+
+	if err := os.MkdirAll(filepath.Join(cfg, "px0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "px0", "settings.json"), []byte(`{"desktop.nativeStyling": false}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if desk := get(trustedDesktopRequest(httptest.NewRequest(http.MethodGet, "/", nil))); !strings.Contains(desk, `<html class="desktop" lang="en"`) {
+		t.Fatal("desktop.nativeStyling=false still marks html.native")
 	}
 }
 
@@ -151,7 +164,7 @@ func TestDeskHandlerSwapClosesOldAndWrapsRequests(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `<html class="desktop"`) {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `<html class="desktop`) {
 		t.Fatalf("desktop request not served as trusted: %d", rec.Code)
 	}
 

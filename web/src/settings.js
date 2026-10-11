@@ -445,6 +445,11 @@ export function applySettingLive(key, val) {
       render();
       break;
     }
+    case 'desktop.nativeStyling': {
+      if (!document.documentElement.classList.contains('desktop')) break;
+      document.documentElement.classList.toggle('native', val !== false && val !== 'false');
+      break;
+    }
     case 'explorer.autoReveal':
     case 'explorer.autoRelveal':
     case 'autoReveal':

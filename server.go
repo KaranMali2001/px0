@@ -647,7 +647,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		html = baseTag + "\n" + html
 	}
 	if isTrustedDesktopRequest(r) {
-		html = desktopIndex(html)
+		html = desktopIndex(html, readMergedSettingsMap()["desktop.nativeStyling"] != false)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, html)
@@ -665,13 +665,26 @@ var desktopSettingsSchema = []settingSchemaItem{
 		Default:     "left",
 		Options:     []string{"left", "right"},
 	},
+	{
+		Key:         "desktop.nativeStyling",
+		Title:       "Native Styling",
+		Description: "Applies macOS-style refinements to the desktop app. Turn off to match the web UI.",
+		Category:    "Workbench",
+		Type:        "boolean",
+		Default:     true,
+	},
 }
 
 // desktopIndex marks the page for html.desktop CSS/JS and points remote
 // fonts, favicons and logos at the embedded copies so the app works offline.
-func desktopIndex(html string) string {
+// native adds html.native, which gates every desktop.nativeStyling refinement.
+func desktopIndex(html string, native bool) string {
+	class := "desktop"
+	if native {
+		class += " native"
+	}
 	return strings.NewReplacer(
-		`<html lang="en"`, `<html class="desktop" lang="en"`,
+		`<html lang="en"`, `<html class="`+class+`" lang="en"`,
 		`"https://px0.ai/favicon`, `"static/static/favicon`,
 		`"https://px0.ai/logo/`, `"static/static/logo/`,
 		`"https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap"`, `"static/static/fonts/fonts.css"`,
