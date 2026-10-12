@@ -2,6 +2,8 @@
 
 This document outlines the step-by-step instructions for preparing, testing, and publishing a new release of `px0`.
 
+For local macOS desktop builds, `make install-local` builds and installs the CLI and native app from the current checkout. Wails converts the tracked `build/appicon.png` into the bundled Dock icon. Quit and reopen px0 after installation to load the updated build and icon.
+
 ## 1. Prerequisites
 
 Before cutting a new release, ensure you have:

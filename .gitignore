@@ -19,6 +19,8 @@ Thumbs.db
 
 # Build artifacts
 build/
+frontend/node_modules/
+frontend/wailsjs/
 web/app.js
 web/vendor/*.min.js
 web/vendor/*.min.js.gz
