@@ -9,14 +9,14 @@ import { warmLSP } from './lsp.js';
    or pick up a server installed by hand, then start it and carry on. */
 
 let setupSeq = 0;
-let pollTimer = 0;
+let setupPollTimer = 0;
 
 const hintHtml = html => '<div class="hint">' + html + '</div>';
 
 // Stops a pending refresh, so it cannot draw over whatever replaced the panel.
 export function cancelLspSetup() {
   setupSeq++;
-  clearTimeout(pollTimer);
+  clearTimeout(setupPollTimer);
 }
 
 export async function renderLspSetup(el, onReady) {
@@ -29,7 +29,7 @@ export async function renderLspSetup(el, onReady) {
   catch (e) { if (my === setupSeq) el.innerHTML = hintHtml('Could not check language servers: ' + esc(e.message)); return; }
   if (my !== setupSeq || doc_() !== d) return;
 
-  const again = ms => { pollTimer = setTimeout(() => { if (my === setupSeq) renderLspSetup(el, onReady); }, ms); };
+  const again = ms => { setupPollTimer = setTimeout(() => { if (my === setupSeq) renderLspSetup(el, onReady); }, ms); };
   if (s.state === 'starting' && !s.server) {
     el.innerHTML = hintHtml('Looking for language servers…');
     again(700);
@@ -77,7 +77,7 @@ function drawSetup(s, d) {
   let html = '<div class="lsp-setup">';
   if (s.state === 'failed') {
     html += '<p><b>' + esc(s.server) + '</b> did not start: <span class="lsp-reason">' + esc(s.reason || 'unknown error') + '</span></p>' +
-      '<div class="lsp-row"><button class="lsp-btn" data-start>Retry</button></div>';
+      '<div class="lsp-row"><button class="lsp-btn" data-start title="Retry starting language server">Retry</button></div>';
     if (offer.length) html += '<p>If it is broken or incomplete, install it again:</p>';
   } else {
     html += '<p>Call trails, hover and precise references for ' + esc(s.lang) + ' need a language server, and none is installed.</p>';
@@ -89,8 +89,8 @@ function drawSetup(s, d) {
       html += '<div class="lsp-opt"><code>' + esc(o.cmd) + '</code><span class="lsp-acts">';
       if (!o.auto) html += '<span class="lsp-need">run in a terminal</span>';
       else if (!o.hasTool) html += '<span class="lsp-need">needs ' + esc(o.tool) + '</span>';
-      else html += '<button class="lsp-btn primary" data-install="' + esc(v.name) + '" data-option="' + i + '"' + (running ? ' disabled' : '') + '>Install</button>';
-      html += '<button class="lsp-btn" data-copy="' + esc(o.cmd) + '">Copy</button></span></div>';
+      else html += '<button class="lsp-btn primary" data-install="' + esc(v.name) + '" data-option="' + i + '"' + (running ? ' disabled' : '') + ' title="Install language server">Install</button>';
+      html += '<button class="lsp-btn" data-copy="' + esc(o.cmd) + '" title="Copy command to clipboard">Copy</button></span></div>';
     });
     if (v.job) html += job(v.job);
     html += '</div>';
@@ -99,7 +99,7 @@ function drawSetup(s, d) {
     html += '<p>px0 has no installer for this one. Install ' + s.servers.map(v => '<b>' + esc(v.name) + '</b>').join(' or ') +
       ' and make sure it is on PATH.</p>';
   }
-  html += '<div class="lsp-row"><span>Installed one yourself?</span><button class="lsp-btn" data-start>Detect and start</button></div></div>';
+  html += '<div class="lsp-row"><span>Installed one yourself?</span><button class="lsp-btn" data-start title="Detect and start language server">Detect and start</button></div></div>';
   return html;
 }
 
@@ -119,7 +119,7 @@ function wire(el, d, onReady) {
     renderLspSetup(el, onReady);
   }));
   el.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', () => {
-    copyToClipboard(b.dataset.copy, 'Copied ' + b.dataset.copy);
+    copyToClipboard(b.dataset.copy, 'Copied ' + b.dataset.copy, b);
   }));
   el.querySelectorAll('[data-start]').forEach(b => b.addEventListener('click', () => start(el, d, onReady)));
 }

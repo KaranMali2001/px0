@@ -1,127 +1,13 @@
 package main
 
 import (
-	"container/list"
 	"fmt"
-	"html"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
 )
-
-func TestTypeScriptMethodMarkupPreservesSource(t *testing.T) {
-	strip := regexp.MustCompile(`<[^>]*>`)
-	for _, src := range []string{
-		"  i() {",
-		"  s() {",
-		"  async s() {",
-		"  private i() {",
-		"  static staticMethod() {",
-		"  get getValue() {",
-	} {
-		t.Run(src, func(t *testing.T) {
-			d := newDoc(src+"\n", "methods.ts")
-			line := d.tokenise(d.src, d.Total)[0]
-			if got := html.UnescapeString(strip.ReplaceAllString(line, "")); got != src {
-				t.Fatalf("source changed: %q, markup %q", got, line)
-			}
-			if strings.Count(line, `<i class=nf>`) != 1 {
-				t.Fatalf("method not styled exactly once: %q", line)
-			}
-		})
-	}
-	for _, src := range []string{"// i() {", "const value = 's() {'", "/*\n  i() {\n*/"} {
-		d := newDoc(src, "comments.ts")
-		for _, line := range d.tokenise(src, d.Total) {
-			if strings.Contains(line, `<i class=nf>`) {
-				t.Fatalf("styled a comment/string: %q", line)
-			}
-		}
-	}
-}
-
-func TestLineOffsetsPreserveEmptyAndUnicodeLines(t *testing.T) {
-	for _, src := range []string{"", "\n", "one\n", "one\n\nthree", "é\n\t世界"} {
-		d := newDoc(src, "plain.txt")
-		lines := strings.Split(src, "\n")
-		if d.Total != len(lines) {
-			t.Fatalf("total = %d, want %d", d.Total, len(lines))
-		}
-		for i, line := range lines {
-			if d.Raw(i+1) != line {
-				t.Fatalf("line %d = %q, want %q", i+1, d.Raw(i+1), line)
-			}
-		}
-	}
-}
-
-func TestHighlightCacheRejectsOversizedNewestDocument(t *testing.T) {
-	c := &hlCache{ll: list.New(), items: map[string]*list.Element{}}
-	d := &Doc{bytes: cacheBudget + 1}
-	c.put("oversized", d)
-	if c.used > cacheBudget || c.get("oversized") != nil {
-		t.Fatal("cache retained oversized newest document")
-	}
-	if d.bytes != cacheBudget+1 {
-		t.Fatal("eviction changed active request's document")
-	}
-}
-
-func TestCacheCoalescesConcurrentOpenDocuments(t *testing.T) {
-	abs := filepath.Join(t.TempDir(), "concurrent.go")
-	if err := os.WriteFile(abs, []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { Evict(abs) })
-	var wg sync.WaitGroup
-	docs := make(chan *Doc, 20)
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			d, err := Open(abs, "concurrent.go")
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			docs <- d
-		}()
-	}
-	wg.Wait()
-	close(docs)
-	var first *Doc
-	for d := range docs {
-		if first == nil {
-			first = d
-		}
-		if d != first {
-			t.Fatal("concurrent opens returned uncached duplicates")
-		}
-	}
-}
-
-func TestRetiredDocumentDoesNotRefine(t *testing.T) {
-	d := newDoc("package main\n", "retired.go")
-	d.retire()
-	d.backgroundPass()
-	if done, coming := d.Exact(); done || coming {
-		t.Fatal("retired document still scheduled refinement")
-	}
-}
-
-func TestTypeScriptMethodNamesAreHighlighted(t *testing.T) {
-	d := newDoc("  async getPaymentById(paymentId: number) {\n    return this.paymentDao.getPaymentById(paymentId)\n  }\n", "PaymentService.ts")
-	lines := d.tokenise(d.src, d.Total)
-	if !strings.Contains(lines[0], `<i class=nf>getPaymentById</i>`) {
-		t.Fatalf("method declaration was not highlighted: %q", lines[0])
-	}
-	if strings.Contains(lines[1], `<i class=nf>getPaymentById</i>`) {
-		t.Fatalf("method call must remain unstyled: %q", lines[1])
-	}
-}
 
 // Windowed lexing must agree with a full-file pass, or the view changes under
 // the user when the background pass lands.
@@ -132,7 +18,14 @@ func fixtures(t *testing.T) []string {
 		root = "."
 	}
 	filepath.WalkDir(root, func(p string, de os.DirEntry, err error) error {
-		if err != nil || de.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if de.IsDir() {
+			name := de.Name()
+			if name == ".git" || name == "bench-repos" || name == "node_modules" || name == "dist" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		switch strings.ToLower(filepath.Ext(p)) {
@@ -143,8 +36,12 @@ func fixtures(t *testing.T) []string {
 		}
 		return nil
 	})
-	if len(files) > 400 {
-		files = files[:400]
+	maxFiles := 400
+	if testing.Short() {
+		maxFiles = 10
+	}
+	if len(files) > maxFiles {
+		files = files[:maxFiles]
 	}
 	if len(files) == 0 {
 		t.Skip("no fixtures")
@@ -254,7 +151,11 @@ func TestConcurrentChunkAccess(t *testing.T) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < 40; i++ {
+			loops := 40
+			if testing.Short() {
+				loops = 4
+			}
+			for i := 0; i < loops; i++ {
 				start := ((w*13 + i*7) % 5) * hlChunk
 				lines, _ := d.Lines(start, start+hlChunk)
 				if len(lines) == 0 {
@@ -365,3 +266,92 @@ func TestEvictRemovesDocument(t *testing.T) {
 		t.Fatalf("expected second Evict to return false")
 	}
 }
+
+func TestEvictAllClearsCache(t *testing.T) {
+	tmp1 := filepath.Join(t.TempDir(), "a.go")
+	tmp2 := filepath.Join(t.TempDir(), "b.go")
+	if err := os.WriteFile(tmp1, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp2, []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(tmp1, "a.go"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(tmp2, "b.go"); err != nil {
+		t.Fatal(err)
+	}
+	cache.mu.Lock()
+	countBefore := len(cache.items)
+	cache.mu.Unlock()
+	if countBefore == 0 {
+		t.Fatalf("expected items in cache")
+	}
+
+	EvictAll()
+
+	cache.mu.Lock()
+	countAfter := len(cache.items)
+	usedAfter := cache.used
+	cache.mu.Unlock()
+	if countAfter != 0 || usedAfter != 0 {
+		t.Fatalf("expected empty cache after EvictAll, got count=%d used=%d", countAfter, usedAfter)
+	}
+}
+
+func TestHighlightDiff(t *testing.T) {
+	// Empty diff
+	if hunks := highlightDiff("foo.go", ""); len(hunks) != 0 {
+		t.Fatalf("expected 0 hunks for empty diff, got %d", len(hunks))
+	}
+
+	diff := `@@ -10,3 +10,4 @@
+ func greet() {
+-	return "hello"
++	// new greeting
++	return "hello world"
+ }`
+
+	hunks := highlightDiff("greet.go", diff)
+	if len(hunks) != 1 {
+		t.Fatalf("expected 1 hunk, got %d", len(hunks))
+	}
+	h := hunks[0]
+	if h.OldStart != 10 || h.NewStart != 10 {
+		t.Fatalf("unexpected hunk starts: old=%d new=%d", h.OldStart, h.NewStart)
+	}
+	if len(h.Rows) != 5 {
+		t.Fatalf("expected 5 rows, got %d", len(h.Rows))
+	}
+
+	// Row 0: ctx (func greet() {)
+	if h.Rows[0].Type != "ctx" || h.Rows[0].Text != "\tfunc greet() {" && !strings.Contains(h.Rows[0].HTML, "class=k") {
+		t.Errorf("row 0 missing keyword class: %s", h.Rows[0].HTML)
+	}
+
+	// Row 1: del (return "hello")
+	if h.Rows[1].Type != "del" || h.Rows[1].OldLine != 11 || h.Rows[1].At != 11 {
+		t.Errorf("row 1 incorrect line numbers: %+v", h.Rows[1])
+	}
+	if !strings.Contains(h.Rows[1].HTML, "class=s") {
+		t.Errorf("row 1 missing string class: %s", h.Rows[1].HTML)
+	}
+
+	// Row 2: add (// new greeting)
+	if h.Rows[2].Type != "add" || h.Rows[2].NewLine != 11 {
+		t.Errorf("row 2 incorrect line numbers: %+v", h.Rows[2])
+	}
+	if !strings.Contains(h.Rows[2].HTML, "class=c") {
+		t.Errorf("row 2 missing comment class: %s", h.Rows[2].HTML)
+	}
+
+	// Row 3: add (return "hello world")
+	if h.Rows[3].Type != "add" || h.Rows[3].NewLine != 12 {
+		t.Errorf("row 3 incorrect line numbers: %+v", h.Rows[3])
+	}
+	if !strings.Contains(h.Rows[3].HTML, "class=k") || !strings.Contains(h.Rows[3].HTML, "class=s") {
+		t.Errorf("row 3 missing keyword or string class: %s", h.Rows[3].HTML)
+	}
+}
+

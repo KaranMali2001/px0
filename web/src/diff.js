@@ -2,9 +2,17 @@
 // Git diff view for the active tab: renders the file's unified diff against
 // HEAD in a dedicated overlay (like the Markdown preview), in either a
 // side-by-side split layout (default) or a single-column unified layout.
-import { $, S, doc_, esc, api, persistPreference } from './state.js';
+// Unlike the code viewport this is not virtualized -- a file's own diff is
+// bounded in size, so a plain DOM render is simple and fast enough.
+import { $, S, doc_, esc, api, MOD } from './state.js';
+import { on } from './bus.js';
 import { syncPreview } from './markdown.js';
 import { setStatusNote, updateStatus } from './status.js';
+import { wordAtPoint } from './cursor.js';
+import { gotoDefinition } from './lsp.js';
+import { hoverAt } from './hover.js';
+import { pushHistory } from './history.js';
+import { COMMIT_STATUS, loadCommitFiles, cachedCommitFiles } from './commitfiles.js';
 
 export const diffview = $('#diffview');
 const diffContent = $('#diffcontent');
@@ -14,15 +22,12 @@ let shown = null; // doc the diff view is currently showing, null while hidden
 // d.diffMode is 'split' | 'unified' | null (off), per tab. The layout last
 // picked (split vs unified) is remembered globally as the default for the
 // next file entering diff view.
-export function setLayoutPref(mode, persist = true) {
-  const split = mode !== 'unified';
-  if (!S.settings) S.settings = {};
-  S.settings['diffEditor.renderSideBySide'] = split;
-  if (persist) persistPreference('diffEditor.renderSideBySide', split).catch(() => {});
+export function setLayoutPref(mode) {
+  try { localStorage.setItem('px0.diffLayout', mode); } catch {}
 }
 
 export function layoutPref() {
-  return S.settings?.['diffEditor.renderSideBySide'] === false ? 'unified' : 'split';
+  try { return localStorage.getItem('px0.diffLayout') || 'split'; } catch { return 'split'; }
 }
 
 function diffMode(d = doc_()) {
@@ -33,16 +38,24 @@ function diffMode(d = doc_()) {
    the layout (split/unified) changes while already showing the same doc --
    switching layout doesn't change which doc is "shown", so that alone can't
    be the signal to redraw. Call whenever either might have changed. */
-export function syncDiffView() {
+export function syncDiffView(force = false) {
   const d = doc_();
   const want = (d && d.diffMode) ? d : null;
-  if (want !== shown) {
+  if (force && want) {
+    want.diffText = undefined;
+    want.diffHunks = undefined;
+  }
+  if (want !== shown || force) {
     shown = want;
     diffview.hidden = !want;
-    if (want) drawDiff(want);
-    else { diffContent.replaceChildren(); diffContent._doc = null; }
-  } else if (want && want.diffHunks !== undefined) {
-    renderDiff(want);
+    if (want) drawDiff(want, force);
+    else { diffContent.replaceChildren(); if (prSyncHandler) prSyncHandler(); }
+  } else if (want) {
+    /* Same doc still on screen. A caller that dropped the cached diff -- the
+       tab being pointed at a different commit, say -- leaves the view showing
+       the wrong revision, so that has to refetch rather than just repaint. */
+    if (want.diffText === undefined) drawDiff(want);
+    else if (want.diffHunks !== undefined) renderDiff(want);
   }
 }
 
@@ -69,6 +82,7 @@ export async function setDiffMode(mode) {
   } else {
     d.diffMode = mode;
     d.diffDismissed = false;
+    d.openedInDiffView = true;
     setLayoutPref(mode);
   }
   syncPreview(); // markdown preview and diff view are mutually exclusive
@@ -76,17 +90,32 @@ export async function setDiffMode(mode) {
   updateStatus();
 }
 
-async function drawDiff(d) {
-  if (d.diffText === undefined) {
+async function drawDiff(d, force = false) {
+  if (force || d.diffText === undefined) {
     diffContent.replaceChildren();
+    /* Which revision this fetch is for. Clicking through a commit's files, or
+       from a commit back to the tree, can leave an earlier request in flight;
+       without this its answer would land in a doc that has since been pointed
+       somewhere else and show the wrong commit's diff. */
+    const ref = d.diffRef || '';
     try {
-      d.diffReq = d.diffReq || api('/api/diff', { path: d.path });
+      d.diffReq = api('/api/diff', { path: d.path, ref });
       const j = await d.diffReq;
-      d.diffHunks = parseDiff(j.diff || '');
-      d.diffText = '';
+      if ((d.diffRef || '') !== ref) return;
+      d.diffText = j.diff || '';
+      d.diffHunks = j.hunks || parseDiff(d.diffText);
+      // In a PR review session the server also splits the diff at the PR's
+      // checked-out head commit: prDiff is the PR's own change (frozen since
+      // checkout/last Pull), yourDiff is whatever the reviewer has edited or
+      // committed locally since then. Undefined outside PR mode.
+      d.prDiffHunks = j.prHunks !== undefined ? j.prHunks : (j.prDiff !== undefined ? parseDiff(j.prDiff) : undefined);
+      d.yourDiffHunks = j.yourHunks !== undefined ? j.yourHunks : (j.yourDiff !== undefined ? parseDiff(j.yourDiff) : undefined);
     } catch (e) {
+      if ((d.diffRef || '') !== ref) return;
       d.diffText = '';
       d.diffHunks = [];
+      d.prDiffHunks = undefined;
+      d.yourDiffHunks = undefined;
       setStatusNote('No diff: ' + e.message, 4000);
     } finally {
       d.diffReq = null;
@@ -97,61 +126,229 @@ async function drawDiff(d) {
   if (d.diffScroll) {
     diffview.scrollTop = d.diffScroll;
     d.diffScroll = 0;
+  } else if (d.cur) {
+    scrollDiffToLine(d.cur);
+  }
+}
+
+export function scrollDiffToLine(line) {
+  if (!diffview || !line) return;
+  const row = diffview.querySelector(`[data-l="${line}"]`) ||
+              diffview.querySelector(`[data-at="${line}"]`) ||
+              diffview.querySelector(`[data-old-l="${line}"]`);
+  if (row) {
+    row.scrollIntoView({ block: 'center', behavior: 'auto' });
+    row.classList.add('diff-row-flash');
+    setTimeout(() => row.classList.remove('diff-row-flash'), 1200);
+  }
+}
+
+function appendHunks(frag, hunks, mode, reviewable) {
+  for (const hunk of hunks) {
+    frag.append(hunkHeader(hunk));
+    frag.append(mode === 'unified' ? unifiedTable(hunk, reviewable) : splitTable(hunk, reviewable));
   }
 }
 
 function renderDiff(d) {
-  if (d.diffHunks?.length) {
-    const total = d.diffHunks.reduce((n, hunk) => {
-      if (d.diffMode === 'split') hunk.pairs ||= pairRows(hunk.rows);
-      return n + (d.diffMode === 'split' ? hunk.pairs.length : hunk.rows.length);
-    }, 0);
-    d.diffPage = Math.min(d.diffPage || 0, Math.floor(Math.max(0, total - 1) / 1000));
-  }
-  const key = d.diffMode + ':' + (d.diffPage || 0);
-  if (diffContent._doc === d && diffContent._key === key) { syncDiffAgentTargets(); return; }
-  diffContent._doc = d;
-  diffContent._key = key;
   diffContent.replaceChildren();
-  if (!d.diffHunks || !d.diffHunks.length) {
-    const p = document.createElement('div');
-    p.className = 'diff-empty';
-    p.textContent = 'No changes against HEAD.';
-    diffContent.append(p);
+  const frag = document.createDocumentFragment();
+  if (d.diffRef) {
+    /* Pinned to one commit by the Unpushed sidebar section. Its line numbers
+       are that commit's, not the working tree's, so nothing here is a review
+       target (reviewable=false) -- see anchor() below. */
+    const hunks = d.diffHunks || [];
+    if (!hunks.length) {
+      const p = document.createElement('div');
+      p.className = 'diff-empty';
+      p.textContent = 'This commit made no change to ' + d.name + '.';
+      diffContent.append(p);
+      return;
+    }
+    frag.append(commitStrip(d));
+    frag.append(createDiffSection(d, 'commit', 'In commit ' + d.diffRef.slice(0, 7),
+      'this commit only, not the working tree', (bodyEl) => appendHunks(bodyEl, hunks, d.diffMode, false)));
+    diffContent.append(frag);
+    syncDiffAgentTargets();
+    if (prSyncHandler) prSyncHandler();
     return;
   }
-  const frag = document.createDocumentFragment();
-  const pageSize = 1000;
-  const total = d.diffHunks.reduce((n, hunk) => {
-    if (d.diffMode === 'split') hunk.pairs ||= pairRows(hunk.rows);
-    return n + (d.diffMode === 'split' ? hunk.pairs.length : hunk.rows.length);
-  }, 0);
-  const start = (d.diffPage || 0) * pageSize;
-  let offset = 0;
-  for (const hunk of d.diffHunks) {
-    const data = d.diffMode === 'split' ? hunk.pairs : hunk.rows;
-    const from = Math.max(0, start - offset);
-    const to = Math.min(data.length, start + pageSize - offset);
-    offset += data.length;
-    if (from >= to) continue;
-    frag.append(hunkHeader(hunk));
-    frag.append(d.diffMode === 'unified' ? unifiedTable(hunk, data.slice(from, to)) : splitTable(hunk, data.slice(from, to)));
-  }
-  if (total > pageSize) {
-    const nav = document.createElement('div');
-    nav.className = 'diff-page';
-    for (const [label, page] of [['Previous', (d.diffPage || 0) - 1], ['Next', (d.diffPage || 0) + 1]]) {
-      const button = document.createElement('button');
-      button.textContent = label;
-      button.disabled = page < 0 || page * pageSize >= total;
-      button.addEventListener('click', () => { d.diffPage = page; renderDiff(d); diffview.scrollTop = 0; });
-      nav.append(button);
+  if (S.meta?.pr && d.prDiffHunks !== undefined) {
+    const prHunks = d.prDiffHunks || [];
+    const yourHunks = d.yourDiffHunks || [];
+    // Opened from the sidebar's "Yours" or "PR changes" scope: open the
+    // matching section and fold the other. Decided once per tab; after that
+    // the section's own header toggle wins.
+    const tree = $('#tree');
+    if (d.prCollapsed === undefined) {
+      d.prCollapsed = !!tree?.classList.contains('scope-yours') && yourHunks.length > 0;
     }
-    nav.append(document.createTextNode(' ' + (start + 1) + '–' + Math.min(total, start + pageSize) + ' of ' + total));
-    frag.prepend(nav);
+    if (d.yourCollapsed === undefined) {
+      d.yourCollapsed = !!tree?.classList.contains('scope-pr') && prHunks.length > 0;
+    }
+    if (!prHunks.length && !yourHunks.length) {
+      const p = document.createElement('div');
+      p.className = 'diff-empty';
+      p.textContent = 'No changes.';
+      diffContent.append(p);
+      return;
+    }
+    frag.append(createDiffSection(d, 'pr', 'PR changes', 'from ' + (S.meta.pr.base || 'base'), (body) => {
+      if (!prHunks.length) body.append(sectionNote('The PR itself makes no change to this file.'));
+      else appendHunks(body, prHunks, d.diffMode, true);
+    }));
+
+    const since = S.meta.pr.headSHA ? 'since ' + S.meta.pr.headSHA.slice(0, 7) : 'since checkout';
+    frag.append(createDiffSection(d, 'you', 'Your changes', since, (body) => {
+      if (!yourHunks.length) body.append(sectionNote('Nothing edited or committed yet — changes you make will show up here.'));
+      else appendHunks(body, yourHunks, d.diffMode, false);
+    }));
+  } else {
+    if (!d.diffHunks || !d.diffHunks.length) {
+      const p = document.createElement('div');
+      p.className = 'diff-empty';
+      p.textContent = 'No changes against HEAD.';
+      diffContent.append(p);
+      return;
+    }
+    appendHunks(frag, d.diffHunks, d.diffMode, true);
   }
   diffContent.append(frag);
   syncDiffAgentTargets();
+  if (prSyncHandler) prSyncHandler();
+}
+
+/* Points a tab's diff at the section the sidebar scope is showing. A section
+   with nothing in it is left open: folding away the only content leaves an
+   empty pane. */
+export function focusDiffScope(d) {
+  const tree = $('#tree');
+  if (!d || !S.meta?.pr || !tree) return;
+  if (tree.classList.contains('scope-yours') && d.yourDiffHunks?.length !== 0) {
+    d.prCollapsed = true; d.yourCollapsed = false;
+  } else if (tree.classList.contains('scope-pr') && d.prDiffHunks?.length !== 0) {
+    d.prCollapsed = false; d.yourCollapsed = true;
+  }
+}
+
+function createDiffSection(d, kind, title, sub, populateBody) {
+  const sec = document.createElement('div');
+  sec.className = 'diff-section diff-section-' + kind;
+  const collapsedKey = kind + 'Collapsed';
+  if (d[collapsedKey]) {
+    sec.classList.add('collapsed');
+  }
+
+  const head = document.createElement('div');
+  head.className = 'diff-section-head diff-section-head-' + kind;
+  head.title = 'Click to collapse/expand section';
+
+  const t = document.createElement('span');
+  t.className = 'diff-section-title';
+  t.textContent = title;
+  head.append(t);
+
+  if (sub) {
+    const s = document.createElement('span');
+    s.className = 'diff-section-sub';
+    s.textContent = sub;
+    head.append(s);
+  }
+
+  const grow = document.createElement('span');
+  grow.className = 'grow';
+  head.append(grow);
+
+  const btn = document.createElement('button');
+  btn.className = 'pr-comments-collapse diff-section-collapse';
+  btn.title = 'Collapse/Expand';
+  btn.innerHTML = '&#9662;';
+  head.append(btn);
+
+  const body = document.createElement('div');
+  body.className = 'diff-section-body';
+  populateBody(body);
+
+  head.addEventListener('click', () => {
+    sec.classList.toggle('collapsed');
+    d[collapsedKey] = sec.classList.contains('collapsed');
+    if (prSyncHandler) prSyncHandler();
+  });
+
+  sec.append(head, body);
+  return sec;
+}
+
+function sectionNote(text) {
+  const el = document.createElement('div');
+  el.className = 'diff-section-note';
+  el.textContent = text;
+  return el;
+}
+
+/* One-way registration for pr.js, mirroring agent.js's hook into selbar.js:
+   diff.js never imports pr.js, it just calls this after every repaint when a
+   PR review session has set it. */
+let prSyncHandler = null;
+export function setPRSyncHandler(fn) { prSyncHandler = fn; }
+
+/* Same one-way registration for tabs.js: diff.js knows how to leave diff mode
+   but not how to move the caret and scroll the (already open) source view to
+   a given line, so it hands the line off to whatever tabs.js registered. */
+let sourceJumpHandler = null;
+export function setSourceJumpHandler(fn) { sourceJumpHandler = fn; }
+
+/* And for the commit strip's ‹ › buttons: tabs.js opens the file stepped to. */
+let commitStepHandler = null;
+export function setCommitStepHandler(fn) { commitStepHandler = fn; }
+
+// The nearest file from i in direction dir that can be opened: binary files
+// have no text diff and /api/file refuses them, so stepping passes over them.
+function commitStepTarget(files, i, dir) {
+  for (let k = i + dir; k >= 0 && k < files.length; k += dir) if (!files[k].binary) return k;
+  return -1;
+}
+
+/* Where a pinned tab's file sits in its commit, with ‹ › to step through the
+   rest. The file list is fetched on first need and filled in when it lands. */
+function commitStrip(d) {
+  const el = document.createElement('div');
+  el.className = 'diff-commit-strip';
+  const fill = files => {
+    const i = files.findIndex(f => f.path === d.path);
+    if (i < 0) { el.remove(); return; }
+    const f = files[i];
+    const g = COMMIT_STATUS[f.status] || ['git-M', f.status];
+    const path = f.from ? esc(f.from) + ' → ' + esc(f.path) : esc(f.path);
+    el.innerHTML =
+      '<span class="gs ' + g[0] + '" title="' + esc(g[1]) + '">' + esc(f.status) + '</span>' +
+      '<span class="dcs-path" title="' + path + '">' + path + '</span>' +
+      (f.binary ? '' : (f.add ? '<span class="up-file-add">+' + f.add + '</span>' : '') + (f.del ? '<span class="up-file-del">&minus;' + f.del + '</span>' : '')) +
+      '<span class="grow"></span>' +
+      '<span class="dcs-pos">' + (i + 1) + ' / ' + files.length + '</span>' +
+      '<button type="button" class="dcs-step" data-commit-step="-1" title="Previous file in this commit"' + (commitStepTarget(files, i, -1) < 0 ? ' disabled' : '') + '>‹</button>' +
+      '<button type="button" class="dcs-step" data-commit-step="1" title="Next file in this commit"' + (commitStepTarget(files, i, 1) < 0 ? ' disabled' : '') + '>›</button>';
+    el.dataset.i = i;
+  };
+  const have = cachedCommitFiles(d.diffRef);
+  if (have) fill(have);
+  else loadCommitFiles(d.diffRef).then(files => { if (el.isConnected || doc_() === d) fill(files); }, () => el.remove());
+  return el;
+}
+
+// The working-tree line number of whichever diff row currently sits at the
+// top of the scrolled viewport -- what "Source" should land on so switching
+// out of diff view keeps you where you were reading, not wherever the
+// doc's cursor last happened to be.
+function currentDiffLine() {
+  if (!diffview || diffview.hidden) return null;
+  const top = diffview.getBoundingClientRect().top;
+  for (const el of diffview.querySelectorAll('[data-l], [data-at]')) {
+    if (el.getBoundingClientRect().bottom > top) {
+      return el.dataset.l !== undefined ? +el.dataset.l : +el.dataset.at;
+    }
+  }
+  return null;
 }
 
 export function syncDiffAgentTargets() {
@@ -162,7 +359,9 @@ export function syncDiffAgentTargets() {
   for (const el of diffview.querySelectorAll('[data-l]')) {
     const l = +el.dataset.l;
     const inAgent = ranges.some(r => l >= r.l1 && l <= r.l2);
+    const isAnchor = ranges.some(r => l === r.l1);
     el.classList.toggle('agent-sel', inAgent);
+    el.classList.toggle('agent-anchor', isAnchor);
   }
 }
 
@@ -206,18 +405,18 @@ function parseDiff(text) {
 
 /* ---------- unified layout: one row per diff line ---------- */
 
-function unifiedTable(hunk, rows = hunk.rows) {
+function unifiedTable(hunk, reviewable = true) {
   const table = document.createElement('div');
   table.className = 'diff-table diff-unified';
-  for (const row of rows) {
+  for (const row of hunk.rows) {
     const r = document.createElement('div');
     r.className = 'diff-row diff-' + row.type;
-    anchor(r, row);
+    anchor(r, row, reviewable);
     r.append(
-      lineCell(row.type === 'add' ? '' : row.oldLine),
-      lineCell(row.type === 'del' ? '' : row.newLine),
+      lineCell(row.type === 'add' ? '' : row.oldLine, reviewable),
+      lineCell(row.type === 'del' ? '' : row.newLine, reviewable),
       markerCell(row.type),
-      codeCell(row.text),
+      codeCell(row),
     );
     table.append(r);
   }
@@ -226,13 +425,13 @@ function unifiedTable(hunk, rows = hunk.rows) {
 
 /* ---------- split layout: deletions and additions paired side by side ---------- */
 
-function splitTable(hunk, pairs = pairRows(hunk.rows)) {
+function splitTable(hunk, reviewable = true) {
   const table = document.createElement('div');
   table.className = 'diff-table diff-split';
-  for (const pair of pairs) {
+  for (const pair of pairRows(hunk.rows)) {
     const r = document.createElement('div');
     r.className = 'diff-row-pair';
-    r.append(splitSide(pair.left, 'left'), splitSide(pair.right, 'right'));
+    r.append(splitSide(pair.left, 'left', reviewable), splitSide(pair.right, 'right', reviewable));
     table.append(r);
   }
   return table;
@@ -256,29 +455,49 @@ function pairRows(rows) {
   return pairs;
 }
 
-function splitSide(row, side) {
+function splitSide(row, side, reviewable = true) {
   const el = document.createElement('div');
   el.className = 'diff-side diff-side-' + side + (row ? ' diff-' + row.type : ' diff-blank');
-  if (!row) { el.append(lineCell(''), markerCell(''), codeCell('')); return el; }
+  if (!row) { el.append(lineCell('', reviewable), markerCell(''), codeCell(null)); return el; }
   const ln = side === 'left' ? row.oldLine : row.newLine;
-  anchor(el, row);
-  el.append(lineCell(ln), markerCell(row.type), codeCell(row.text));
+  anchor(el, row, reviewable);
+  el.append(lineCell(ln, reviewable), markerCell(row.type), codeCell(row));
   return el;
 }
 
 /* Stamps where a row points in the working tree, so a selection on it can be
    edited. Context and added lines have a line on disk (data-l), which a context
    line shares across both sides of the split. A deleted line has none, only the
-   place it used to be (data-at). */
-function anchor(el, row) {
+   place it used to be (data-at).
+   reviewable marks whether this row's line number is meaningful as a GitHub
+   review-comment target -- true for the PR's own diff (numbered against the
+   checked-out head commit, which is what a submitted review is posted
+   against), false for the reviewer's local "Your changes" section, whose
+   lines don't correspond to anything pushed yet. linecomment.js reads this
+   to fall back to a plain inline AI edit instead of opening the composer. */
+function anchor(el, row, reviewable = true) {
   if (row.newLine !== undefined) el.dataset.l = row.newLine;
   else if (row.at !== undefined) el.dataset.at = row.at;
+  if (row.oldLine !== undefined) el.dataset.oldL = row.oldLine;
+  if (!reviewable) el.dataset.reviewable = '0';
 }
 
-function lineCell(n) {
+function lineCell(n, reviewable = true) {
   const el = document.createElement('div');
   el.className = 'diff-ln';
-  el.textContent = n === '' || n === undefined ? '' : String(n);
+  if (n !== '' && n !== undefined) {
+    el.classList.add('diff-ln-nav');
+    let title = 'Open in file view at line ' + n;
+    const d = doc_();
+    el.title = title;
+    const btn = document.createElement('span');
+    btn.className = 'line-btn';
+    btn.setAttribute('role', 'button');
+    btn.title = (S.meta?.pr && reviewable) ? 'Thread, review comment and line actions' : 'Thread and line actions';
+    btn.textContent = 'Edit';
+    el.append(btn);
+  }
+  el.append(document.createTextNode(n === '' || n === undefined ? '' : String(n)));
   return el;
 }
 
@@ -291,10 +510,18 @@ function markerCell(type) {
   return el;
 }
 
-function codeCell(text) {
+function codeCell(arg) {
   const el = document.createElement('div');
   el.className = 'diff-code';
-  el.innerHTML = esc(text || '') || '&nbsp;';
+  if (!arg) {
+    el.innerHTML = '&nbsp;';
+    return el;
+  }
+  if (typeof arg === 'string') {
+    el.innerHTML = esc(arg) || '&nbsp;';
+    return el;
+  }
+  el.innerHTML = arg.html || esc(arg.text || '') || '&nbsp;';
   return el;
 }
 
@@ -307,11 +534,71 @@ export function initDiff() {
   // Each half of the switch names a view, so a click shows that view rather than toggling.
   $('#diff-source')?.addEventListener('click', e => {
     e.stopPropagation();
-    setDiffMode('source');
+    const line = currentDiffLine();
+    if (line && sourceJumpHandler) sourceJumpHandler(line);
+    else setDiffMode('source');
+  });
+  diffContent.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    if (e.target.closest('.line-btn') || e.target.closest('.diff-ln-nav')) return;
+    const diffCode = e.target.closest('.diff-code');
+    if (!diffCode) return;
+    const w = wordAtPoint(e.clientX, e.clientY);
+    if (!w) return;
+    S.at = w;
+    S.lastWord = w.word;
+    const d = doc_();
+    if (e[MOD]) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (d) pushHistory(d.path, w.line);
+      // Plain click keeps the current mode; Alt flips it.
+      const inDiff = !!d.diffMode;
+      gotoDefinition(w, { view: (e.altKey ? !inDiff : inDiff) ? 'diff' : 'source' });
+      return;
+    }
+  });
+
+  // Clicking a line number jumps straight to the full file at that line --
+  // the diff shows what changed, but reading it usually means seeing it in
+  // context, not just the hunk. Clicking a symbol highlights and opens hover actions.
+  diffContent.addEventListener('click', e => {
+    const step = e.target.closest('[data-commit-step]');
+    if (step) {
+      const d = doc_();
+      const files = d && cachedCommitFiles(d.diffRef);
+      const next = files?.[commitStepTarget(files, +step.closest('.diff-commit-strip').dataset.i, +step.dataset.commitStep)];
+      if (!step.disabled && next && commitStepHandler) commitStepHandler(d, next);
+      return;
+    }
+    if (e.target.closest('.line-btn')) return;
+    const cell = e.target.closest('.diff-ln-nav');
+    if (cell) {
+      const rowEl = cell.closest('[data-l], [data-at]');
+      if (!rowEl || !sourceJumpHandler) return;
+      e.stopPropagation();
+      const line = rowEl.dataset.l !== undefined ? +rowEl.dataset.l : +rowEl.dataset.at;
+      sourceJumpHandler(line);
+      return;
+    }
+    const diffCode = e.target.closest('.diff-code');
+    if (diffCode && !e[MOD]) {
+      const w = wordAtPoint(e.clientX, e.clientY);
+      if (w) {
+        S.at = w;
+        S.lastWord = w.word;
+        hoverAt(e.clientX, e.clientY);
+      }
+    }
+  });
+
+  diffContent.addEventListener('dblclick', e => {
+    const w = wordAtPoint(e.clientX, e.clientY);
+    if (w) { S.at = w; S.lastWord = w.word; }
   });
   $('#diff-btn')?.addEventListener('click', e => {
     e.stopPropagation();
-    setDiffMode(doc_()?.diffMode || layoutPref());
+    toggleDiff();
   });
   const menu = $('#diff-menu');
   if (menu) {
@@ -323,4 +610,6 @@ export function initDiff() {
       item.blur();
     });
   }
+  on('tab:activated', () => syncDiffView());
+  on('tabs:cleared', () => syncDiffView());
 }

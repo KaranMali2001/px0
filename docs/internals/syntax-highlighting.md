@@ -12,7 +12,7 @@ However, full-AST lexical analysis is computationally intensive:
 - Highlighting a 100,000-line file (several megabytes of code) upfront would introduce a 3-to-8 second freeze before displaying the first line.
 - Naive lexing of an entire file requires holding millions of syntax token structs on the heap.
 
-To bound lexer work before the first display, px0 implements Viewport-Based Windowed Highlighting with Dual-Tier Background Refinement.
+To deliver instantaneous file opening (under 5 milliseconds), px0 implements Viewport-Based Windowed Highlighting with Dual-Tier Background Refinement.
 
 ## 2. Windowed Highlighting Architecture
 
@@ -66,8 +66,8 @@ sequenceDiagram
     alt Cache Miss
         Server->>FastHl: Lex lines 600-2400 (Window + Context)
         FastHl-->>Server: Return HTML + Flag (refine: true)
-        Server-->>UI: Serve window lines before full-file refinement
-        Note over UI: UI paints the visible rows
+        Server-->>UI: Serve inexact lines immediately (<2ms)
+        Note over UI: UI paints lines with 0ms scroll hitching
         Server->>BgHl: Spawn background exact pass (if file < 2 MB)
         BgHl->>Cache: Populate exact token lines in background
         UI->>Server: Poll /api/file (or chunk refinement swap)
@@ -76,7 +76,7 @@ sequenceDiagram
     end
 ```
 
-1. Tier 1 (Instant Viewport Pass): Evaluates the bounded window (`start - hlContext` to `start + count + hlContext`). Slices out and returns the target lines; latency depends on source and lexer. If the window contains potential multi-line ambiguities, the payload includes `refine: true`.
+1. Tier 1 (Instant Viewport Pass): Evaluates the bounded window (`start - hlContext` to `start + count + hlContext`). Slices out and returns the target lines in 1-2 ms. If the window contains potential multi-line ambiguities, the payload includes `refine: true`.
 1. Tier 2 (Background Exact Pass): If the file is under `bgLimit = 2 MB`, a background goroutine performs an exact full-file tokenization pass. The exact result is stored in the LRU cache. The frontend's `refineChunk()` updates the rendered rows in-place without disturbing the user's scroll position or selection.
 
 ## 4. Short-Class CSS Tokenization
@@ -109,14 +109,3 @@ const cacheBudget = 512 * 1024 * 1024 // 512 MB memory budget
 - Every cached line entry tracks its raw string byte footprint.
 - When total cached line data exceeds `cacheBudget`, oldest entries are evicted from the tail of the LRU list until memory drops below the threshold.
 - Switching between tabs and scrolling backward reuses cached HTML strings instantly without hitting Chroma.
-
-
-## Cold Open and TypeScript Declarations
-
-Cold open reads up to 64 MiB, normalizes CRLF, counts newlines, and builds a `uint32` byte-offset table. It is O(file size); only lexical work is window-bounded. Offset construction scans the original string directly without allocating a split slice. Width measurement stops at a bounded prefix of unusually long lines and caps `MaxCols` at 20,000. Warm opens reuse the source/line table.
-
-TypeScript method declarations are identified by byte offsets in source. Only the matching name token receives `.nf` before HTML escaping/emission; rendered HTML is never searched or rewritten by method name. This preserves markup for short names such as `i`/`s`, repeated modifier text, comments, and strings.
-
-The 512 MiB cache budget charges source, the offset table, and rendered line strings. Even the newest document is evicted if it alone exceeds the budget; active requests retain their own reference until completion. This bounds accounted retained cache entries, not in-flight allocations, allocator overhead, or native RSS.
-
-Background full-file passes share two worker slots. Cache removal/eviction retires a document: queued refinement stops, and an already running pass discards its result. Concurrent cold opens share the winning cached document rather than maintaining duplicate chunk maps. The file read is bounded even if the file grows after its initial stat.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -11,6 +12,7 @@ import (
 // Go counts bytes, JavaScript counts UTF-16 units, and the protocol defaults to
 // UTF-16 while some servers negotiate UTF-8.
 func TestPositionEncodings(t *testing.T) {
+	t.Parallel()
 	// "héllo → wörld" mixes 1-, 2- and 3-byte runes.
 	line := "héllo → wörld"
 	cases := []struct {
@@ -41,6 +43,7 @@ func TestPositionEncodings(t *testing.T) {
 }
 
 func TestUTF16ToByte(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		line string
 		u16  int
@@ -63,6 +66,7 @@ func TestUTF16ToByte(t *testing.T) {
 }
 
 func TestURIRoundTrip(t *testing.T) {
+	t.Parallel()
 	paths := []string{
 		"/home/user/project/main.go",
 		"/home/user/my project/a b.go", // spaces must be escaped
@@ -94,6 +98,7 @@ func TestURIRoundTrip(t *testing.T) {
 
 // A disabled manager must never resolve a server, whatever is installed.
 func TestManagerDisabled(t *testing.T) {
+	t.Parallel()
 	m := newLSPManager(t.TempDir(), false)
 	if got := m.Available(); len(got) != 0 {
 		t.Errorf("disabled manager offers %v", got)
@@ -106,8 +111,26 @@ func TestManagerDisabled(t *testing.T) {
 	}
 }
 
+func TestManagerCloseLatches(t *testing.T) {
+	t.Parallel()
+	m := newLSPManager(t.TempDir(), false)
+	m.enabled = true
+	m.byExt[".go"] = &lspServerDef{Name: "fake", Cmd: []string{"true"}}
+	m.Close()
+	if _, err := m.client(context.Background(), "x.go"); err != errStopped {
+		t.Errorf("client after Close = %v, want errStopped", err)
+	}
+	if err := m.StartServer("fake"); err != errStopped {
+		t.Errorf("StartServer after Close = %v, want errStopped", err)
+	}
+	if m.AnyRunning() {
+		t.Error("closed manager reports a running server")
+	}
+}
+
 // Only paths a server actually named may be opened outside the indexed tree.
 func TestExternalAllowlist(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	ix := NewIndex(root)
 	ix.Build()
@@ -131,6 +154,7 @@ func TestExternalAllowlist(t *testing.T) {
 }
 
 func TestLanguageIDMapping(t *testing.T) {
+	t.Parallel()
 	var ts lspServerDef
 	for _, d := range lspRegistry {
 		if d.Name == "typescript" {
@@ -149,6 +173,7 @@ func TestLanguageIDMapping(t *testing.T) {
 }
 
 func TestLSPCloseDoc(t *testing.T) {
+	t.Parallel()
 	cl := newLSPClient(lspServerDef{Name: "test", Cmd: []string{"echo"}}, t.TempDir())
 	cl.opened["file:///test.go"] = 1
 
@@ -164,3 +189,4 @@ func TestLSPCloseDoc(t *testing.T) {
 	// Repeated closeDoc does not panic
 	cl.closeDoc("/test.go")
 }
+

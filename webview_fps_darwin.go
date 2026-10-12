@@ -4,7 +4,7 @@ package main
 
 /*
 #cgo CFLAGS: -x objective-c -fblocks
-#cgo LDFLAGS: -framework Cocoa -framework WebKit -framework UniformTypeIdentifiers
+#cgo LDFLAGS: -framework Cocoa -framework WebKit
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 #import <dispatch/dispatch.h>

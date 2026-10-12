@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -122,10 +123,8 @@ func (m *lspManager) Rescan() {
 	}
 	m.discover()
 	m.mu.Lock()
-	if !m.closed {
-		m.failed = map[string]string{}
-		m.restarts = nil
-	}
+	m.failed = map[string]string{}
+	m.restarts = nil
 	m.mu.Unlock()
 }
 
@@ -186,15 +185,9 @@ func (m *lspManager) Install(name string, option int) (*lspJob, error) {
 		return nil, fmt.Errorf("%s is not installed", in.Cmd[0])
 	}
 
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil, context.Canceled
-	}
 	m.jobMu.Lock()
 	if j := m.jobs[name]; j != nil && j.Running {
 		m.jobMu.Unlock()
-		m.mu.Unlock()
 		return m.job(name), nil
 	}
 	j := &lspJob{Server: name, Cmd: strings.Join(in.Cmd, " "), Running: true, out: &tailBuffer{max: 16 << 10}}
@@ -202,26 +195,16 @@ func (m *lspManager) Install(name string, option int) (*lspJob, error) {
 		m.jobs = map[string]*lspJob{}
 	}
 	m.jobs[name] = j
-	m.spawns.Add(1)
 	m.jobMu.Unlock()
-	m.mu.Unlock()
 
 	go m.runInstall(def, j, tool, in.Cmd[1:])
 	return m.job(name), nil
 }
 
 func (m *lspManager) runInstall(def *lspServerDef, j *lspJob, tool string, args []string) {
-	defer m.spawns.Done()
-	parent := m.ctx
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(parent, lspInstallTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), lspInstallTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, tool, args...)
-	setProcessGroup(cmd)
-	cmd.Cancel = func() error { return killCommand(cmd) }
-	cmd.WaitDelay = 500 * time.Millisecond
 	// Outside the workspace, so its go.mod or package.json cannot change what is installed.
 	if home, err := os.UserHomeDir(); err == nil {
 		cmd.Dir = home
@@ -229,16 +212,15 @@ func (m *lspManager) runInstall(def *lspServerDef, j *lspJob, tool string, args 
 	cmd.Stdout, cmd.Stderr = j.out, j.out // stdin stays empty: a prompt fails instead of hanging
 
 	err := cmd.Run()
-	if cmd.Process != nil {
-		killCommand(cmd)
-	}
 	switch {
-	case errors.Is(ctx.Err(), context.Canceled):
-		err = ctx.Err()
 	case ctx.Err() != nil:
 		err = fmt.Errorf("gave up after %s", lspInstallTimeout)
 	case err == nil:
 		m.Rescan()
+		// Rescan→discover already invalidates the binary cache, but make it
+		// explicit here: the install→fresh-status guarantee shouldn't depend
+		// on that chain surviving future refactors.
+		invalidateBinaryCache()
 		if _, found := lookPathIn(def.Cmd[0], lspBinDirs()); !found {
 			err = fmt.Errorf("installed, but %s is not on PATH or in the usual install folders", def.Cmd[0])
 		}
@@ -308,6 +290,10 @@ func localPost(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) handleLSPSetup(w http.ResponseWriter, r *http.Request) {
+	if s.lsp == nil {
+		fail(w, 503, "language servers are disabled")
+		return
+	}
 	_, rel, ok := s.resolvePath(r.URL.Query().Get("path"))
 	if !ok {
 		fail(w, 400, "bad path")
@@ -317,6 +303,10 @@ func (s *Server) handleLSPSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLSPInstall(w http.ResponseWriter, r *http.Request) {
+	if s.lsp == nil {
+		fail(w, 503, "language servers are disabled")
+		return
+	}
 	if !localPost(w, r) {
 		return
 	}
@@ -330,15 +320,169 @@ func (s *Server) handleLSPInstall(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, j)
 }
 
-// handleLSPStart finds servers installed since startup, clears earlier start
-// failures and starts the server for path, reporting where it has got to.
-func (s *Server) handleLSPStart(w http.ResponseWriter, r *http.Request) {
+func (s *Server) relevantLSPServers() []map[string]any {
+	if s.lsp == nil || !s.lsp.Enabled() {
+		return []map[string]any{}
+	}
+
+	extMap := map[string]bool{}
+	if s.ix != nil {
+		for _, f := range s.ix.Files() {
+			ext := strings.ToLower(filepath.Ext(f.Path))
+			if ext != "" {
+				extMap[ext] = true
+			}
+		}
+	}
+
+	seen := map[string]bool{}
+	var result []map[string]any
+
+	// 1. Add servers matching extensions present in the workspace
+	for i := range lspRegistry {
+		def := &lspRegistry[i]
+		matchesExt := false
+		for _, ext := range def.Exts {
+			if extMap[ext] {
+				matchesExt = true
+				break
+			}
+		}
+		if matchesExt && !seen[def.Name] {
+			seen[def.Name] = true
+			result = append(result, s.lsp.ServerStatus(def))
+		}
+	}
+
+	// 2. Also include any server that is currently running or starting.
+	// Snapshot the names under RLock first: ServerStatus takes m.mu.RLock
+	// itself, and Go's RWMutex is not reentrant, so holding the lock across
+	// the call would deadlock.
+	s.lsp.mu.RLock()
+	var extra []string
+	for name := range s.lsp.clients {
+		if !seen[name] {
+			extra = append(extra, name)
+		}
+	}
+	for name := range s.lsp.starting {
+		if !seen[name] {
+			extra = append(extra, name)
+		}
+	}
+	s.lsp.mu.RUnlock()
+	for _, name := range extra {
+		for i := range lspRegistry {
+			if lspRegistry[i].Name == name {
+				seen[name] = true
+				result = append(result, s.lsp.ServerStatus(&lspRegistry[i]))
+				break
+			}
+		}
+	}
+
+	return result
+}
+
+// handleLSPServers returns the list of all language servers relevant to the workspace
+// along with their runtime states.
+func (s *Server) handleLSPServers(w http.ResponseWriter, r *http.Request) {
+	if s.lsp == nil {
+		writeJSON(w, map[string]any{
+			"enabled":    false,
+			"anyRunning": false,
+			"servers":    []any{},
+		})
+		return
+	}
+	servers := s.relevantLSPServers()
+	anyRunning := false
+	for _, srv := range servers {
+		if r, ok := srv["running"].(bool); ok && r {
+			anyRunning = true
+			break
+		}
+	}
+	if !anyRunning && s.lsp.AnyRunning() {
+		anyRunning = true
+	}
+	writeJSON(w, map[string]any{
+		"enabled":    s.lsp.Enabled(),
+		"anyRunning": anyRunning,
+		"servers":    servers,
+	})
+}
+
+// handleLSPStop stops a running language server or all servers.
+func (s *Server) handleLSPStop(w http.ResponseWriter, r *http.Request) {
+	if s.lsp == nil {
+		fail(w, 503, "language servers are disabled")
+		return
+	}
 	if !localPost(w, r) {
 		return
 	}
+	server := r.URL.Query().Get("server")
+	if server == "" {
+		var body struct {
+			Server string `json:"server"`
+		}
+		if json.NewDecoder(r.Body).Decode(&body) == nil && body.Server != "" {
+			server = body.Server
+		}
+	}
+	s.lsp.Stop(server)
+	s.handleLSPServers(w, r)
+}
+
+// handleLSPStart finds servers installed since startup, clears earlier start
+// failures and starts the server for path or server name, reporting status.
+func (s *Server) handleLSPStart(w http.ResponseWriter, r *http.Request) {
+	if s.lsp == nil {
+		fail(w, 503, "language servers are disabled")
+		return
+	}
+	if !localPost(w, r) {
+		return
+	}
+	server := r.URL.Query().Get("server")
+	if server == "" {
+		var body struct {
+			Server string `json:"server"`
+			All    bool   `json:"all"`
+		}
+		if json.NewDecoder(r.Body).Decode(&body) == nil {
+			if body.All {
+				server = "all"
+			} else {
+				server = body.Server
+			}
+		}
+	}
+
+	if server != "" {
+		if server == "all" {
+			servers := s.relevantLSPServers()
+			for _, srv := range servers {
+				if inst, _ := srv["installed"].(bool); inst {
+					if name, _ := srv["name"].(string); name != "" {
+						_ = s.lsp.StartServer(name)
+					}
+				}
+			}
+		} else {
+			if err := s.lsp.StartServer(server); err != nil {
+				fail(w, 400, err.Error())
+				return
+			}
+		}
+		s.handleLSPServers(w, r)
+		return
+	}
+
 	_, rel, ok := s.resolvePath(r.URL.Query().Get("path"))
 	if !ok {
-		fail(w, 400, "bad path")
+		fail(w, 400, "bad path or server required")
 		return
 	}
 	s.lsp.Rescan()
@@ -352,7 +496,11 @@ func (s *Server) handleLSPStart(w http.ResponseWriter, r *http.Request) {
 // language that lacks a server when none is installed, so the UI can offer one.
 func (s *Server) lspBrief(rel string) map[string]any {
 	state, srv := s.lsp.State(rel)
-	b := map[string]any{"state": string(state), "server": srv}
+	b := map[string]any{
+		"state":      string(state),
+		"server":     srv,
+		"anyRunning": s.lsp.AnyRunning(),
+	}
 	if lang := s.lsp.MissingLang(rel); lang != "" {
 		b["missing"] = lang
 	}

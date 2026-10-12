@@ -1,5 +1,6 @@
 // web/src/inspector.js
-import { $, $$, esc, doc_, api } from './state.js';
+import { $, $$, esc, S, doc_, api, apiPostJson } from './state.js';
+import { emit } from './bus.js';
 import { layout, render } from './renderer.js';
 import { updateStatus, setStatusNote } from './status.js';
 import { openFile, centerLine } from './tabs.js';
@@ -8,9 +9,45 @@ import { loadOutline, drawOutline } from './outline.js';
 import { displayPath, cancelSearch } from './search.js';
 import { groupHits, flashFind, canAskServer, lspCall, positionNow } from './lsp.js';
 
-export function showRightInspector(tab = 'refs') {
+let inspectorRestored = false;
+let inspectorSave = Promise.resolve();
+
+function saveInspectorState() {
+  if (!inspectorRestored) return;
+  const panel = $('#right-side');
+  if (!panel) return;
+  const inspector = {
+    hidden: document.body.classList.contains('right-hidden'),
+    tab: $('.inspector-tab.active')?.dataset.itab || firstInspectorTab(),
+    width: Math.round(Math.max(200, Math.min(700, parseFloat(getComputedStyle(panel).width) || 384))),
+  };
+  inspectorSave = inspectorSave.then(() => apiPostJson('/api/session', { inspector }, { keepalive: true })).catch(() => {});
+}
+
+export function restoreInspectorState(inspector) {
+  if (inspector) {
+    const panel = $('#right-side');
+    if (panel && Number.isFinite(inspector.width)) panel.style.width = Math.max(200, Math.min(700, inspector.width)) + 'px';
+    document.body.classList.toggle('right-hidden', inspector.hidden === true);
+    const tab = $$('.inspector-tab').find(b => b.dataset.itab === inspector.tab);
+    setRightInspectorTab(tab ? inspector.tab : firstInspectorTab());
+    layout();
+    render();
+  } else {
+    showRightInspector();
+  }
+  inspectorRestored = true;
+}
+
+export function firstInspectorTab() {
+  if ($('#tab-threads') && !$('#tab-threads').hidden) return 'threads';
+  const first = Array.from($$('.inspector-tab')).find(b => !b.hidden);
+  return first?.dataset.itab || 'threads';
+}
+
+export function showRightInspector(tab) {
   document.body.classList.remove('right-hidden');
-  setRightInspectorTab(tab);
+  setRightInspectorTab(tab || $('.inspector-tab.active')?.dataset.itab || firstInspectorTab());
   layout();
   render();
 }
@@ -18,6 +55,7 @@ export function showRightInspector(tab = 'refs') {
 export function hideRightInspector() {
   cancelSearch();
   document.body.classList.add('right-hidden');
+  saveInspectorState();
   layout();
   render();
 }
@@ -29,11 +67,14 @@ export function setRightInspectorTab(tab) {
   $('#pane-right-symbols')?.classList.toggle('active', tab === 'symbols');
   $('#pane-right-calls')?.classList.toggle('active', tab === 'calls');
   $('#pane-right-search')?.classList.toggle('active', tab === 'search');
-  if (tab === 'symbols') {
+  $('#pane-right-threads')?.classList.toggle('active', tab === 'threads');
+  if (tab === 'threads') emit('threads:shown');
+  if (tab === 'symbols' && !document.body.classList.contains('right-hidden')) {
     loadOutline();
     $('#right-symbols-filter')?.focus();
   }
-  if (tab === 'search') $('#q')?.focus();
+  if (tab === 'search' && !document.body.classList.contains('right-hidden')) $('#q')?.focus();
+  saveInspectorState();
 }
 
 export function renderRightResults(word, hits, server, isExact) {
@@ -127,6 +168,7 @@ export function initInspector() {
   }));
 
   $('#btn-close-right')?.addEventListener('click', hideRightInspector);
+  $('#btn-open-right')?.addEventListener('click', () => showRightInspector());
 
   /* Right inspector resizer */
   (() => {
@@ -139,7 +181,7 @@ export function initInspector() {
       const w = Math.max(200, Math.min(700, window.innerWidth - e.clientX));
       $('#right-side').style.width = w + 'px';
     });
-    addEventListener('mouseup', () => { if (dragging) { dragging = false; rrz.classList.remove('drag'); layout(); render(); } });
+    addEventListener('mouseup', () => { if (dragging) { dragging = false; rrz.classList.remove('drag'); saveInspectorState(); layout(); render(); } });
   })();
 
   /* Right-side symbols list navigation */
@@ -165,7 +207,8 @@ export function initInspector() {
       if (!g) return;
       const hidden = g.style.display === 'none';
       g.style.display = hidden ? '' : 'none';
-      $('.ar', t).innerHTML = hidden ? '&#9660;' : '&#9654;';
+      const ar = $('.ar', t);
+      if (ar) ar.innerHTML = hidden ? '&#9660;' : '&#9654;';
       return;
     }
     const r = e.target.closest('.rline');

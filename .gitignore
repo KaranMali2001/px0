@@ -1,6 +1,7 @@
 dist/
 bench-repos/
 px0
+px0.exe
 *.test
 *.prof
 
@@ -20,6 +21,9 @@ Thumbs.db
 build/
 frontend/node_modules/
 frontend/wailsjs/
+web/app.js
+web/vendor/*.min.js
+web/vendor/*.min.js.gz
 
 # Logs
 *.log

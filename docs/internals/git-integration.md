@@ -1,6 +1,6 @@
-# Git Awareness & Diffing
+# Git Awareness, Diffing & Stage/Commit/Push/Pull
 
-This document describes the design and implementation of px0's git integration engine ([`git.go`](../../git.go)) and its diff-rendering frontend ([`web/src/diff.js`](../../web/src/diff.js)).
+This document describes the design and implementation of px0's git integration engine ([`git.go`](../../git.go)), its diff-rendering frontend ([`web/src/diff.js`](../../web/src/diff.js)), and the sidebar git panel that stages, commits, pushes, and pulls ([`web/src/gitpanel.js`](../../web/src/gitpanel.js), [`web/src/tree.js`](../../web/src/tree.js)).
 
 ## 1. Zero-Dependency Shell-Out Architecture
 
@@ -8,9 +8,10 @@ px0 avoids heavy third-party Go git libraries (such as `go-git`, which can consu
 
 Instead, px0 adheres to a Pure Shell-Out Architecture:
 
-- Shells out directly to the host `git` binary.
-- Never stages, commits, or changes refs or the index. The only workspace writes px0 makes are the ones a dispatched coding harness makes itself ([Harness Editing & Agent Dispatch](agent-editing.md)).
-- Zero disk footprint: holds all status and diff structures in volatile memory on the `Index` (`Node.Status`).
+- Shells out directly to the host `git` binary, for reads (`status`, `diff`, `merge-base`) and, since the git panel, for writes (`add`, `reset`, `commit`, `push`, `fetch`, `merge --ff-only`, `reset --hard`).
+- Status and diffing themselves never stage, commit, or change refs or the index — that half of the engine is still purely read-only. The git panel's write endpoints (`/api/git/stage`, `unstage`, `commit`, `push`, `pull`) are the only exception, and every one of them fires exactly once per explicit click; nothing runs on a timer or in response to a file change. See §9.
+- A dispatched coding harness ([Harness Editing & Agent Dispatch](agent-editing.md)) can still write anything else in the workspace — including, via **Commit with AI**, the *text* of a commit message — but never touches git state itself; only px0's own git-panel endpoints do that.
+- Zero disk footprint: holds all status and diff structures in volatile memory on the `Index` (`Node.Status`, `Node.Staged`).
 - Graceful degradation: if `git` is not installed, or if the opened directory is not a git repository, git features degrade silently without warnings or errors.
 - Can be disabled explicitly using the `-no-git` CLI flag.
 
@@ -52,6 +53,8 @@ Git status codes are mapped onto tree nodes:
 - `U`: Untracked
 - `R`: Renamed
 
+Separately, `Node.Staged` (a plain bool, not folded into the status letter) tracks whether a file has staged index changes — see §9 for how the git panel populates and reacts to it.
+
 ### Ancestor Folder Dirty Propagation (`Node.Dirty`)
 
 When a file is modified, its status is recorded on its `Node.Status`. Furthermore, every ancestor folder in its path hierarchy is marked `Dirty: true`:
@@ -73,7 +76,7 @@ for p := rel; p != ""; {
 
 This enables the file tree in the sidebar to visually highlight collapsed directories that contain modified descendants, allowing developers to immediately spot repository changes.
 
-## 4. Diffing: Dedicated Requests and Three Views
+## 4. Diffing: One Git Call, Two Consumers, Three Views
 
 Both the line gutter and the full diff view are read off the same shell-out, `gitDiff(root, relpath)`:
 
@@ -81,7 +84,7 @@ Both the line gutter and the full diff view are read off the same shell-out, `gi
 git diff --no-color HEAD -- <path>
 ```
 
-`/api/file` performs no Git diff work. `/api/gutter` and `/api/diff` each fetch one diff for their own request; the tab caches gutter metadata and parsed diff hunks until reload. Scroll/refinement chunk reads therefore do not repeat full-file diffs. Commands have a ten-second context, bounded pipe waits, Unix process-group cancellation, and a 16 MiB output cap. Oversized or timed-out previews return an error rather than incomplete changes.
+The raw unified diff text is cached at that call site; everything downstream (line-range extraction in Go, and hunk parsing in the browser) is a pure parse of that one string, so a file is never diffed against `HEAD` more than once per request.
 
 ### Gutter Change Indicators (`/api/gutter?path=...`)
 
@@ -101,7 +104,7 @@ When viewing a file, the editor displays green, blue, and red markers in the lin
 
 The active tab gets a `Source | Diff` switch next to the tab bar (`#diff-switch`, shown only when `d.diffAvailable`) whenever the open file is modified in a git repo. `#diff-source` and `#diff-btn` each show their own view, and hovering the Diff half opens the Split/Unified menu; `Cmd/Ctrl+D` toggles the same thing, resuming whichever layout was used last (`localStorage['px0.diffLayout']`, default `split`). Diff view and the Markdown preview are mutually exclusive — entering one hides the other — and each tab remembers its own state on `d.diffMode` (`'split' | 'unified' | null`).
 
-Unlike the main code view, the diff is **not** rendered through the virtualized `#rows` viewport. `diff.js` renders at most 1000 unified rows or split pairs per page into a dedicated `#diffview` overlay — the same overlay-over-`#viewport` pattern the Markdown preview uses (see [Markdown Preview](markdown.md)), just with its own content:
+Unlike the main code view, the diff is **not** rendered through the virtualized `#rows` viewport. A single file's diff is small (bounded by the size of that one file), so `diff.js` renders it as plain DOM into a dedicated `#diffview` overlay — the same overlay-over-`#viewport` pattern the Markdown preview uses (see [Markdown Preview](markdown.md)), just with its own content:
 
 1. **Parse.** `parseDiff(text)` splits the raw diff on `@@ ... @@` hunk headers and walks each hunk's `+`/`-`/context lines once, tagging every row `add` / `del` / `ctx` and carrying its old-file and/or new-file line number. This runs once per file per session; the parsed hunks are cached on `d.diffHunks` so switching Split ↔ Unified re-renders from memory with no re-fetch.
 1. **Unified layout.** One row per parsed line: old-line column, new-line column (whichever side doesn't apply is blank), a `+`/`-` marker, and the code — a direct read of `d.diffHunks`, GitHub-"unified"-style.
@@ -110,3 +113,291 @@ Unlike the main code view, the diff is **not** rendered through the virtualized 
 Every rendered row that exists in the working tree carries its line in `data-l`, on both halves of a split context row; a deleted row carries `data-at`, the working-tree line it sat before. `selbar.js` reads these so a selection anywhere in the diff can drive the selection bar, the right-click menu and Edit with Agent (see [Harness Editing & Agent Dispatch](agent-editing.md)).
 
 Both layouts share the same hunk-header, line-number, marker, and code-cell builders; only the row-shape (one column vs. two) differs, so a fix to how a line renders never needs to be made twice.
+
+## 5. Real-Time Streaming & Adaptive Monitoring Engine
+
+To keep git statuses, sidebar badges, and editor gutter diff indicators in sync without requiring manual page reloads or full workspace re-indexing, px0 uses a hybrid real-time monitoring engine (`git_watcher.go` and `web/src/gitstream.js`).
+
+### Design Constraints: Small vs. Massive Repositories
+
+| Approach | Small Repo (< 1k files) | Massive Repo (> 100k files, e.g. Linux / Chromium) | Verdict |
+| :--- | :--- | :--- | :--- |
+| **Recursive FS Watcher (`inotify`)** | Fast, low RAM | Exhausts OS watch descriptors (`max_user_watches`), high memory footprint, breaks across symlinks / mount points | **Rejected** |
+| **Fixed High-Frequency Polling** | Instant updates (~6ms) | Heavy CPU and battery drain (100k+ file `git status` takes 150ms-1s) | **Rejected** |
+| **px0 Hybrid Adaptive Engine** | Sub-millisecond latency, zero RAM overhead | Sub-millisecond on CLI git actions; worktree polling throttled dynamically; CPU usage bounded $\le 10\%$ | **Adopted** |
+
+### Dual-Layer Hybrid Architecture
+
+1. **Sub-millisecond Metadata Stat-Checking (Fast Path)**
+   - Every 1 second, px0 checks the `os.Stat` timestamps and sizes of key `.git` control files: `.git/index`, `.git/HEAD`, and `.git/packed-refs`.
+   - Any git operation performed in the terminal (`git commit`, `git checkout`, `git add`, `git reset`, `git merge`) immediately touches these files.
+   - When a metadata change is detected, px0 triggers an immediate `UpdateGitStatus()` and broadcasts the delta to the frontend within milliseconds without waiting for the next worktree poll.
+
+2. **Adaptive Worktree Polling (Worktree Path)**
+   - To catch file changes made outside the git CLI (e.g. saving an editor file or external scripts), the engine polls `UpdateGitStatus()`.
+   - **Self-Tuning Frequency**: Measures the exact execution time of the previous `git status` call and adjusts the polling interval:
+     $$\text{interval} = \max(2\,\text{s}, \min(15\,\text{s}, \text{execution\_time} \times 10))$$
+     On small repositories (~6ms execution), it polls every 2 seconds. On massive repositories (~1s execution), it expands the interval to 10-15 seconds, ensuring git polling never consumes more than a modest fraction of one CPU core.
+
+3. **Visibility & Focus Gating**
+   - **Page Visibility API**: When the browser tab is hidden (`document.visibilityState === 'hidden'`), the frontend closes the SSE connection. The backend detects zero active subscribers and pauses background worktree polling completely, saving CPU and laptop battery.
+   - **Instant Focus Wakeup**: When the user switches back to px0 (`focus` or `visibilitychange` to visible), the client reconnects and immediately issues a POST to `/api/git/refresh` to catch any changes made while the user was in another application.
+
+### Desktop Idle Policy
+
+The CLI server keeps the loop above unchanged (1 s metadata ticker, 1–10 s adaptive worktree ticker; `gitMetaPoll`/`gitWorktreePollMin`/`gitWorktreePollMax` in `git_watcher.go`, pinned by `TestDefaultServerKeepsUpstreamIntervals`). With a webview always connected, that loop cost the desktop app ~2.4% idle CPU, so `desktop.go` calls `GitWatcher.SetIdlePolicy()`, which hands the running watcher an `idlePolicy` and switches it to `idleLoop`:
+
+- **Foreground cadence**: one timer drives both checks and fires every 1 s, like upstream. A poll is cheap: it stats `.git/index`, `.git/HEAD` and `.git/packed-refs` (`recordGitMeta`) and fingerprints the next window of the indexed worktree (`worktreeScan.tick`: mtime of indexed directories, then mtime and size of indexed files, at most `worktreeWindow` = 2,000 `lstat`s per poll, rotating through the tree). Git (`refresh`, which spawns `git status` and friends) runs when a window's fingerprint differs from its last pass. Creating, deleting or renaming a file bumps its directory's mtime and editing bumps the file's. Repos under 2,000 entries fit in one window, so external changes show within ~1 s; on larger repos a change outside the current window is picked up by the ≤5 s backoff refresh (pinned by `TestWorktreeScanWindowMissCaughtByBackoff`).
+- **Backoff**: a full git refresh also runs on a backoff schedule as a safety net for anything the stats miss (files created after the index was built, refs written outside the watched files). It starts at 1 s, doubles every 3 consecutive quiet refreshes (1 → 2 → 4 → 5 s cap) and snaps back to 1 s on any change. The upstream floor (5× the last git or stat scan time, max 10 s) still slows polling on large repos.
+- **Background**: while the window is hidden or minimised it polls every 5 s (metadata only, since no client is subscribed).
+- **Foreground return**: coming back triggers an immediate refresh and resets the backoff.
+
+Trade-off: the first version also backed off the poll itself (1 → 5 s), which cut foreground idle CPU from 1.32% to 0.24% but raised change-to-explorer latency after 15 s of foreground idle from 0.83 s to 1.70 s (medians). Polling stays at 1 s now and only the git spawn is skipped, so a quiet foreground poll costs a few thousand `lstat`s instead of several git processes. `BenchmarkWorktreeCheapTick` (`go test -run '^$' -bench WorktreeCheapTick .`) times one poll over a synthetic 50,000-file tree (Apple M4): fingerprinting the whole tree took 94 ms, 21.8 MB and 151,504 allocs per poll (~9% of a core at 1 s); the 2,000-entry window takes 3.1 ms, 0.84 MB and 5,833 allocs. The remaining ~3 allocs per entry come from building the path and `os.Lstat`; the entry hash is inlined FNV-1a and no longer allocates. To measure: launch the built `.app` against a `/tmp` fixture repo with an isolated `HOME`, leave it focused and idle for 15 s, create a file from a shell, and time how long it takes to appear in the explorer (median of 5 runs, target ≤ 1.0 s). Measure idle CPU as described in `BENCHMARKS.md` §6.
+
+**Change notifications (macOS desktop).** `fsevents_darwin.go` sets `startTreeEvents`, and `idleLoop` then takes worktree changes from an FSEvents stream on the root instead of `worktreeScan`. The 1 s timer only stats the three `.git` metadata files, which also covers a git dir outside the root. An event runs git when it names a directory that can affect status (`relevant`: not `.git/…` and not inside a directory the index skipped as ignored), at most once per `idleBase`. If the client is hidden, the change waits for the focus refresh. The foreground backoff is replaced by a 1 min safety refresh (`eventSafety`), and FSEvents' dropped-event flags count as a change. If the stream cannot start, the polling loop above runs unchanged. The idle-policy tests run against real FSEvents under `-tags desktop` and against a fake source (`TestIdlePolicyTreeEventsRefresh`) otherwise.
+
+**No git during the initial build.** `Index.Build` already runs git status before its walk, so `Subscribe` does not run another while the index is building (a second `git status -uall` raced the walk for the disk). A client that connects mid-build gets its status from `sendWhenReady` once the index is ready, and `idleLoop` skips its ticks until then (`TestSubscribeBeforeIndexReady`).
+
+No new frontend code: `GitWatcher.SetForeground` is driven by the signals `web/src/gitstream.js` already sends. Hiding the page closes the SSE stream (last `Subscribe` cancel → background), showing it reconnects (first `Subscribe` → foreground), and window `focus` POSTs `/api/git/refresh` (`handleGitRefresh` → foreground, backoff reset). A visible but unfocused window is not reported and is treated as foreground. Changes therefore appear within ~1 s in the foreground or after regaining focus, and within ~6 s in the background. On the CLI there is no policy and `SetForeground` does nothing.
+
+4. **In-Memory Concurrency & Tree Updates (`UpdateGitStatus`)**
+   - Refreshing git status does not re-walk the directory tree on disk.
+   - `Index.UpdateGitStatus()` executes `gitStatus(ix.root)` concurrently, compares the new status map against `ix.gitStatusMap`, and if changed, updates `Node.Status` and `Node.Dirty` in-place on existing `ix.children` nodes.
+   - If the status map is identical, no memory allocations or broadcasts occur.
+
+5. **Server-Sent Events (SSE) Stream (`/api/stream` / `/api/git/stream`)**
+   - Implemented using Go standard library `http.Flusher` without external dependencies.
+   - Dispatches structured events (`git-status` and `metrics`):
+     ```
+     event: git-status
+     data: {"git":true,"gitChanges":2,"gitFiles":["main.go","git.go"],"statuses":{"main.go":"M","git.go":"M"},"dirtyDirs":{"web":true}}
+     ```
+   - Sends `: ping\n\n` comments every 15 seconds to keep connections alive across reverse proxies.
+
+6. **In-Place DOM Patching (`web/src/tree.js`)**
+   - The frontend receives the delta payload and calls `patchTreeGitStatus(statuses, dirtyDirs)`.
+   - Rather than tearing down the sidebar file tree, it toggles `.dirty` on directory rows and updates badge elements (`.gs`) and `.git-*` status classes on affected file rows.
+   - Tab diff dots (`.tab-git-dot`), diff toggle buttons (`#diff-switch`), and active editor gutter lines are refreshed in-place without disturbing scroll position or editor state.
+
+## 6. How Git Detects Changes Under the Hood
+
+To understand why px0's metadata stat-checking fast path works in sub-milliseconds, it is essential to understand how Git itself detects changes in the working tree.
+
+### The Stat Cache (`.git/index`)
+
+Git does **not** read or compute cryptographic hashes (SHA-1 / SHA-256) of every file in the repository on every status check. On a 50,000-file repository, reading and hashing gigabytes of source code would take tens of seconds and stall developer workflows.
+
+Instead, Git maintains a binary cache in `.git/index` containing metadata for every tracked file:
+
+* **`mtime`**: Last modified timestamp (stored as seconds and nanoseconds).
+* **`ctime`**: Status change timestamp.
+* **`size`**: Exact file size in bytes (truncated to 32 bits).
+* **`inode` & `dev`**: File system device and inode numbers.
+* **`mode`**: File permissions (e.g. `100644` standard, `100755` executable, `120000` symlink).
+* **`blob SHA`**: The hash of the file contents when it was last staged or committed.
+
+```
+Working Tree File                      .git/index (Binary Cache)
+┌─────────────────────────┐            ┌────────────────────────────────────────┐
+│ src/main.go             │            │ src/main.go                            │
+│ - size: 4,120 bytes     │  lstat()   │ - cached size: 4,120 bytes             │
+│ - mtime: 09:15:02.1492  │ ◄────────► │ - cached mtime: 09:15:02.1492          │
+│ - inode: 849201         │  metadata  │ - cached inode: 849201                 │
+│                         │ comparison │ - blob SHA: 3a7f92b1c8e0...            │
+└─────────────────────────┘            └────────────────────────────────────────┘
+```
+
+### The `lstat()` Fast-Path
+
+When `git status` or `git diff` runs:
+
+1. **Lightweight System Call**: Git calls `lstat()` on each working tree file. `lstat()` only reads filesystem directory entries and inode records; it does not read file contents.
+2. **Metadata Comparison**: Git compares the file's live `mtime`, `size`, `inode`, and `mode` against the record stored in `.git/index`.
+3. **Instant Skip (Unchanged)**: If the metadata matches identically, Git **guarantees the file is untouched**. It skips reading or hashing the file completely.
+4. **Targeted Read (Modified)**: Only when the timestamp, size, or mode differs does Git open the file, calculate its blob SHA, and compare it against the cached `blob SHA`.
+5. **Merkle Tree Pruning (`Index` vs `HEAD`)**: For comparing staged files against the `HEAD` commit, Git compares the 20-byte/32-byte tree hashes. If a directory tree hash matches `HEAD`, the entire subdirectory subtree is skipped in memory without examining individual files.
+
+Because `lstat()` is memory-cached by the OS VFS page cache, a full `git status` scan across 50,000 files completes in 10–25 milliseconds.
+
+### Why Every Git CLI Command Touches `.git/index`
+
+Whenever a developer runs a Git command in the terminal (`git checkout`, `git reset`, `git add`, `git commit`, `git restore`, `git stash`, or `git merge`):
+
+* Git updates the working tree and writes a new index via an atomic `.git/index.lock` swap (`rename()`).
+* This atomic rename guarantees that the `mtime` and `ctime` of `.git/index` change.
+* Git also updates `.git/HEAD` or ref pointers (`.git/refs/heads/<branch>` or `.git/packed-refs`).
+
+By monitoring the `os.Stat` timestamp of just `.git/index`, `.git/HEAD`, and `.git/packed-refs`, px0's fast path detects any terminal Git action in sub-millisecond time without scanning the workspace.
+
+---
+
+## 7. End-to-End Reactive Streaming Architecture
+
+The following sequence illustrates the entire lifecycle from an external git checkout/reset command in a terminal to the real-time UI reconciliation in the browser:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Developer (Terminal / CLI)
+    participant FS as Local Filesystem (.git/index)
+    participant GW as px0 GitWatcher (Go Backend)
+    participant SSE as SSE Stream (/api/git/stream)
+    participant JS as Browser Frontend (gitstream.js)
+    participant UI as DOM (Tree, Tabs, Diff Overlay)
+
+    Dev->>FS: Run `git checkout -- file.go` or `git reset`
+    FS-->>FS: Atomic rename of `.git/index.lock` -> `.git/index`
+    Note over GW: metaTicker (1s) checks os.Stat on .git/index
+    GW->>FS: os.Stat(".git/index")
+    FS-->>GW: mtime changed!
+    GW->>GW: UpdateGitStatus() runs concurrent `git status --porcelain=v2`
+    GW->>SSE: Broadcast JSON payload {statuses, gitChanges, dirtyDirs}
+    SSE-->>JS: EventSource receives `git-status` event
+    JS->>UI: patchTreeGitStatus(statuses, dirtyDirs) (removes .dirty badges)
+    JS->>UI: Reconcile open tabs (auto-close discarded diff tabs)
+    JS->>UI: If clean and in changed-only mode -> switch to files explorer
+```
+
+### Auto-Closing Discarded / Reset Diff Tabs
+
+When developers use px0 to inspect AI agent changes or review git branches, they frequently open modified files directly in git diff view (`diffMode: 'split' | 'unified'`). When changes to those files are subsequently discarded or checked out in the terminal (`git checkout -- file` or `git reset`):
+
+1. **Diff Tab Tracking**: Tabs opened with git changes or toggled into diff view are tagged with `openedInDiffView = true` alongside `diffMode` in [`web/src/tabs.js`](../../web/src/tabs.js).
+2. **Reverse-Order Reconciliation**: When `handleGitStatus(data)` receives an updated status payload where `statuses[t.path]` is clean (`!isDiff`):
+   ```javascript
+   for (let i = S.tabs.length - 1; i >= 0; i--) {
+     const t = S.tabs[i];
+     if (t.diffRef) continue; // pinned to a commit; see §10
+     const code = statuses[t.path];
+     const isDiff = !!code && code !== 'U';
+     const wasDiff = !!(t.diffMode || t.openedInDiffView);
+     if (wasDiff && (t.diffAvailable || t.diffMode) && !isDiff) {
+       closeTab(i);
+     }
+   }
+   ```
+   Iterating in reverse index order ensures index stability when removing multiple tabs simultaneously.
+3. **Active Pointer Stability**: In `closeTab(i)`, closing tabs to the left of the currently active tab decrements `S.active` (`S.active--`) rather than jumping the user to an unintended tab.
+4. **Empty State & Explorer Fallback**: If all git changes are discarded while the sidebar is in changed-only mode (`#tree.changed-only`), px0 automatically toggles back to standard file explorer mode so the user is never left viewing an empty tree.
+
+## 8. Diffing Against an Arbitrary Base
+
+`gitDiff`/`gitHunks` above are thin `base="HEAD"` wrappers around `gitDiffAgainst`/`gitHunksAgainst`, which take an arbitrary base ref rather than assuming the working tree's `HEAD`. The one other caller is PR review (`px0 <url>`), which diffs a checked-out PR against its merge-base with the target branch instead. See [GitHub PR Review](github-pr-review.md).
+
+## 9. Stage, Commit, Push, Pull
+
+The sidebar git panel (`web/src/gitpanel.js`) and the file tree's per-row stage tick (`web/src/tree.js`) are the write half of git integration. Every action is a single explicit HTTP call from a button or tick click; nothing here is triggered by the status watcher, a timer, or a file change.
+
+### Staged-Path Tracking
+
+`gitStagedPaths(root)` (`git.go`) runs `git diff --name-only --cached -z` and maps each path through the same `repoRelKey` helper `gitStatusAgainst` uses, so staged state is keyed identically to status. `Index.gitStagedMap` and `Node.Staged` carry it alongside the existing `gitStatusMap`/`Node.Status`, populated in both `Index.Build()` and `Index.UpdateGitStatus()`. `UpdateGitStatus`'s "did anything change" check compares *both* maps — staging a file often leaves its collapsed status letter unchanged (a modified-and-unstaged `M` and a modified-and-staged `M` are the same letter), so comparing status alone would silently swallow a stage/unstage broadcast. `GitStatusPayload` (`git_watcher.go`) carries the resulting `Staged` map and the current `Branch` name (`gitCurrentBranch`) down the same SSE stream (`/api/stream`) that already pushes status.
+
+### Stage / Unstage / Commit
+
+`gitStage`/`gitUnstage`/`gitCommit` (`git.go`) are thin wrappers around `git add -- <path>`, `git reset -- <path>`, and `git commit -m <message>`. An empty path to `gitStage` means "the served root itself", so **Stage All** reuses the same `/api/git/stage` endpoint with `path: "."` instead of a dedicated route. `gitCommit` checks `gitStagedPaths` before shelling out, so an empty index fails fast with "nothing staged to commit" rather than surfacing git's own message. All three endpoints (`handleGitStage`, `handleGitUnstage`, `handleGitCommit` in `server.go`) validate `path` through `s.safePath` — the same traversal guard `handleFile`/`handleRaw` use — and call `s.gitWatcher.Trigger()` on success so the SSE stream broadcasts immediately instead of waiting for the next poll tick.
+
+### Fast-Forward-Only Pull
+
+`gitFFOnlyPull(root, remote, ref)` fetches `ref` from `remote` and runs `git merge --ff-only FETCH_HEAD`. If that merge fails for any reason, it returns the sentinel `errNotFastForward` without having touched history — px0 never falls back to a real merge, so there is never a conflicted state to clean up. `handleGitPull` (`server.go`) checks `gitHasUncommittedChanges` first and refuses outright (409) if the working tree is dirty, then resolves the branch's upstream (`gitUpstream`, wrapping `git rev-parse --abbrev-ref <branch>@{u}`) and calls `gitFFOnlyPull`. A `409` with `errNotFastForward` becomes a plain-language refusal ("can't fast-forward ... resolve manually, not supported here") rather than raw git output.
+
+In a PR review session, Pull instead re-syncs with the pull request's current head — see [GitHub PR Review §7](github-pr-review.md).
+
+### Push
+
+For a plain workspace, `handleGitPush` runs a bare `gitPush` (`git push`); if that fails specifically because the branch has no upstream, it retries once with `gitPushSetUpstream(root, "origin", branch)`. Neither path ever forces. In a PR review session, `s.pr.Push()` takes over instead — see [GitHub PR Review §7](github-pr-review.md).
+
+### Commit with AI
+
+**Commit with AI** is a text-generation dispatch, not a file edit: `agentManager.StartPrompt(label, prompt)` (`agent.go`) is a sibling of `StartBatch` that skips every file-range concern — no snippet read, no overlap check, no target path — and reuses the same `run()` executor (spawn, stream stdout/stderr into `tailBuffer`s, `changedSince` diff). `handleGitCommitMessage` (`server.go`) builds the prompt from the staged file paths (`gitStagedFiles`), diffstat (`gitStagedStat`), capped staged diff (`gitStagedDiff`), and the `git.commitMessageInstruction` setting via `commitMessagePrompt` (`agent.go`), and refuses with 400 before ever dispatching a harness if nothing is staged. The frontend polls the returned job through the same `/api/agent/job` endpoint an inline edit uses, drops the (fence-stripped) `stdout` into the commit textarea, and immediately calls `/api/git/commit` with it — two endpoints, one user action.
+
+### HTTP Surface
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/git/stage` | POST | `{path}` — stage a file, or `"."` for everything. |
+| `/api/git/unstage` | POST | `{path}` — unstage a file. |
+| `/api/git/commit` | POST | `{message}` — commit whatever is staged. `400` if nothing is. |
+| `/api/git/push` | POST | Push the current branch, or (PR session) the PR's head branch. |
+| `/api/git/pull` | POST | Fast-forward pull, or (PR session) re-sync with the PR head. `409` on divergence or uncommitted changes. |
+| `/api/git/commit-message` | POST | Dispatch the selected harness to write a commit message for the staged diff. Returns an `agentJob`, polled via `/api/agent/job`. `400` if nothing is staged or no harness is selected. |
+
+Every write endpoint is guarded by `localPost` ([`lspsetup.go`](../../lspsetup.go)), the same POST-only, same-origin, IP-or-localhost check every other mutating px0 endpoint uses.
+
+## 10. Unpushed Commits (`@{u}..HEAD`)
+
+Everything above diffs against the working tree. The moment a change is committed it leaves that view entirely — the tree goes clean, the gutter empties, the diff tab closes — even though a local commit is exactly the thing most likely to still need reading. Section 10 is the read path for those commits, from `git commit` until `git push`.
+
+It is strictly read-only: no endpoint here writes to the index, a ref, or a remote. Every call fails quiet the way the rest of `git.go` does — no upstream, no git, or an unknown SHA all yield an empty result rather than an error, and the sidebar section simply doesn't appear.
+
+### Which Commits, and Against What
+
+`gitUpstreamRef(root)` runs `git rev-parse --abbrev-ref --symbolic-full-name @{u}` and returns the tracking branch as git names it (`origin/master`). `gitUnpushedCommits(root, limit)` then logs `@{u}..HEAD`, newest first.
+
+Unlike `gitAheadBehind`, there is **no `origin/<branch>` fallback and no "count every local commit" fallback**. Those exist so the Push button can still light up on an unpublished branch, where being approximately right is better than being dead. A list of commits is different: measuring it against a branch git does not consider upstream would show a confident, wrong answer. With no upstream configured, `/api/unpushed` reports `available: false` and the section is hidden.
+
+The upstream ref name travels with the list and is rendered beside the section title, because "unpushed" alone doesn't say *unpushed where* — a branch can be ahead of `origin/master` and behind a fork's.
+
+### Per-Commit Reads
+
+Three reads share one set of `git diff-tree` flags (`commitDiffArgs`): `--no-commit-id -r -m --first-parent --root`. That combination gives one entry per **path** rather than per tree, and `--root` means the repository's very first commit still has something to diff against, so it needs no empty-tree special case. `-m --first-parent` makes a merge commit diff against the branch it merged into, which is the only reading of a merge that matches what the sidebar claims to be listing.
+
+| Function | Shell-out | Returns |
+| --- | --- | --- |
+| `gitCommitFiles(root, sha)` | `git diff-tree --name-status -z …` + `gitCommitNumstat` (`git show --numstat -z -m --first-parent`) | Paths the commit touched, with git's status letter (`M`/`A`/`D`/`R`/`C`/`T`) and each path's `add`/`del` line counts (`binary` when numstat reports `-`), mapped through `repoRelKey` so a repo served from a subdirectory lists only what it can open. |
+| `gitCommitDetail(root, sha)` | `git show -s --format=…` + `git diff-tree --numstat …` | Author, email, relative and ISO dates, the full message, and the files/insertions/deletions diffstat. |
+| `gitDiffCommit(root, relpath, sha)` | `git diff-tree -p --no-color …` | The unified diff that commit alone made to one file. |
+
+`gitHunksCommit` feeds `gitDiffCommit`'s output to `parseDiffHunks` — the same state machine `gitHunksAgainst` uses, split out of it so a commit's gutter and the working tree's are parsed by one piece of code.
+
+Every SHA that reaches `exec.Command` as a bare revision passes `validSHA` (`^[0-9a-fA-F]{4,40}$`) first. The only way a SHA reaches these endpoints is from a list px0 itself produced, so anything else is a bug or a probe; refusing it keeps a crafted `--upload-pack=…` out of an argument list.
+
+### The `ref` Parameter on `/api/diff` and `/api/gutter`
+
+Rather than add two more endpoints, the existing diff and gutter endpoints take an optional `ref`:
+
+- **`ref` empty** — unchanged: the working tree against `s.diffBase` (`HEAD`, or a PR merge-base in review mode).
+- **`ref=<sha>`** — that commit's own diff, via `gitDiffCommit`/`gitHunksCommit`. The working tree is not consulted at all, so the result is frozen no matter what is edited afterwards.
+
+`/api/file` takes the same parameter, for one reason: a file the commit **deleted** has nothing on disk, so the existing "does the working tree have a diff for it" check can't vouch for it and the open would 404. With a `ref`, `handleFile` asks whether that commit touched the path instead, and returns the same zero-line `deleted: true` document a working-tree deletion produces.
+
+### HTTP Surface
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/unpushed` | GET | `{available, upstream, commits[]}` — commits in `@{u}..HEAD`, newest first. `available: false` with no upstream or nothing ahead. |
+| `/api/commitfiles?sha=` | GET | `{sha, files[]}` — the paths one commit touched, with status letters and line counts. Empty list for an unknown SHA. |
+| `/api/commitdetail?sha=` | GET | Author, message and diffstat for the hover card. `404` for an unknown SHA. |
+| `/api/diff?path=&ref=` | GET | With `ref`, that commit's diff for the file instead of the working tree's. |
+| `/api/gutter?path=&ref=` | GET | Same, for the change gutter. |
+| `/api/file?path=&ref=` | GET | `ref` only matters for a file the commit deleted; it opens as a zero-line deleted document so its diff can be read. |
+
+All six are GET reads with no `localPost` guard, because none of them changes anything.
+
+### Frontend (`web/src/unpushed.js`)
+
+The section lives under the file tree in the sidebar, behind the same **changed files only** toggle as the dirty-file filter — it is a review view, not a home-screen fixture. That toggle's availability is now `hasGitView()` in `tree.js`, which is true when there are working-tree changes **or** unpushed commits: committing everything empties the tree, and without counting commits the toggle would disable itself exactly when the section it reveals became the only thing worth looking at. On a clean tree the tree stops claiming the sidebar's spare height (`#tree.changed-only.no-changes`) and says "Working tree clean", leaving the section the whole of the view.
+
+Clicking a commit expands it into its file list, badged with the same `git-M`/`git-A`/`git-D` classes the tree uses. Clicking a file opens it with `openFile(path, { ref, view: 'diff' })`. A tab carries that commit on `d.diffRef`, shows `@<short-sha>` in the tab strip, and renders its diff in a labelled `In commit <sha>` section. Opening the same path from anywhere else — tree, search, go-to-definition — passes no ref and puts the tab back on the working tree, which is what "open this file" means everywhere else in px0.
+
+A commit-pinned tab is deliberately invisible to the working-tree reconciliation in `gitstream.js`: it is skipped by the auto-close pass, by the `diffAvailable` sync, and by the reload trigger. The working tree going clean is precisely when you still want to be reading one. The ref is persisted in the workspace session (`SessionTab.Ref`), so a reload comes back pinned.
+
+The list is refreshed from the `ahead` count and head SHA that already ride on every git-status SSE tick, so it re-reads `git log` only when one of them actually moved, and explicitly after a commit, push, pull or reindex. A commit that disappears (amend, rebase, push) drops its cached file list and detail with it. A commit's file rows are built `COMMIT_FILES_PAGE` (100) at a time behind a **Show 100 more** row (`web/src/commitfiles.js`), and only while that commit is open. A squash or a vendor bump can touch thousands of paths: building them all at once for a 20,000-file commit cost 224k DOM nodes and a 550 MB tab, where one page costs about 1,000 nodes.
+
+### Recent Commits (`web/src/gitpanel.js`)
+
+The git panel's Recent Commits list uses the same reads and the same pinned tabs. `/api/git/log` now also returns each commit's full SHA (`full`), so a file opened from either list pins its tab to the same `diffRef`. Clicking a commit expands it into its files from `/api/commitfiles`, drawn with the same `commitfiles.js` rows and paging; collapsing deletes the rows rather than hiding them. The git-status stream re-sends the recent commits on every tick, so the list is rebuilt only when the commits themselves change, and open commits are re-expanded from cache. The short-hash chip copies the SHA; arrow keys, Enter and Space move through commits and files.
+
+### Stepping Through a Commit (`web/src/diff.js`)
+
+A pinned tab's diff view opens with a strip showing the file's status, path, line counts and place in the commit (`3 / 17`), with ‹ › to step to the neighbouring file. The file list comes from `/api/commitfiles` once per SHA through `loadCommitFiles` (`commitfiles.js`), cached and shared with the sidebar rows, since a commit's files never change. `stepCommitFile` (`tabs.js`) opens the next file pinned to the same commit and closes the tab stepped away from, so stepping swaps a tab in place rather than leaving one open per file. Binary files are passed over (`commitStepTarget`): they have no text diff, and `/api/file` refuses to open them.
+
+### Hover Cards That Stay Open (`web/src/cardkeep.js`)
+
+Hovering a commit opens a card with its author, full message and diffstat (insertions green, deletions red), a **Copy SHA** button, and a best-effort GitHub link on the author name: a `users.noreply.github.com` address carries the login outright and becomes a profile link, any other address can only support "this repository's commits by this address", and a non-GitHub remote gets no link at all.
+
+Both this card and the existing LSP hover card used to close before you could reach them. Two separate causes, both fixed in `cardkeep.js`, which now owns the lifetime of each:
+
+1. A card armed its hide from a `mouseleave` on whatever sat underneath it and gave the pointer a fixed window to arrive. Cross the gap slower than that — or pause on the way — and the card was gone before the pointer reached it, with nothing left listening to cancel the timer, because the pointer had already left every element that was.
+2. "Is the pointer still near the card" was measured from an anchor captured when the card was *requested*, not when it opened. A hover response can take seconds, so the card could appear anchored to where the pointer used to be, and the very next move read as "left the card".
+
+`makeCardKeeper(el, { hide })` replaces both with one document-level pointer track — so the pointer is never unobserved, wherever it goes — one timer per card, and every decision made against where the pointer is *now*: inside the card (plus slack), or anywhere in the rectangle spanned by the anchor and the card, which is the path a pointer travelling towards it takes. `reanchor()` moves that rectangle's origin when an awaited card finally renders, so a slow response can't strand it.

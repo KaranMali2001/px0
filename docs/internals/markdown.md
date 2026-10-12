@@ -175,11 +175,22 @@ These cases come from the browser checks run against the implementation:
 
 - GitHub alerts. A blockquote whose first paragraph opens with `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` or `[!CAUTION]` loses the marker, gains a `.md-alert-title` paragraph, and gets `.md-alert .md-alert-<kind>`.
 - Code block wrappers. Each `<pre>` moves into `.md-pre`, which carries `data-lang` for a corner label and a copy button. The button holds an SVG icon rather than a text label, because find in the preview walks text nodes and would otherwise match the word "Copy".
+- Mermaid diagrams. A fence whose `data-lang` is `mermaid` keeps its sanitized source block and copy button, then `web/src/mermaid.js` renders a diagram beside it. Successful renders hide the source block and provide per-diagram zoom controls; failed renders leave the source visible with a local error message.
 - Inline image enhancements. Every kept `<img>` is injected with `loading="lazy"` and `decoding="async"`, preventing layout shifts and deferring offscreen network transfers. Standalone images receive `.md-zoomable`, affording hover highlights and zoom-in cursors.
 - Interactive Lightbox (`#img-lightbox`). Clicking a standalone image opens a centered modal over a blurred backdrop (`rgba(0, 0, 0, 0.72)` + `backdrop-filter: blur(8px)`). The lightbox displays natural dimensions, offers an "Open in Tab" button (to promote the image into a dedicated image tab), a "Copy Path" button, and dismisses on `Esc` or backdrop click.
 - Broken image recovery. An error event listener registered during the capture phase on `#md` detects failed image loads and replaces the element with a styled `.md-img-broken` card displaying the missing path. See [Image Viewer Architecture](image-viewer.md) for full details.
 
 Styles live under `/* ---------- markdown preview ---------- */` in [`web/style.css`](../../web/style.css). They read only existing theme tokens, so all themes work without changes. Alerts set a local `--alert` property from existing tokens: Note `--accent`, Tip `--gi`, Important `--nc`, Warning `--mark-active`, Caution `--err`. [`styling-and-themes.md`](styling-and-themes.md) lists every token the preview uses.
+
+### Mermaid Diagrams
+
+Mermaid is a presentation-stage enhancement, not a server renderer. `renderFence` emits the same escaped `<pre><code>` and `data-line` metadata as every other fence. After `mdSanitize` has rejected repository-supplied SVG, `renderMermaidBlocks` lazy-loads the pinned, same-origin `web/vendor/mermaid-12.0.0.min.js` asset and inserts Mermaid's generated SVG. The runtime is fetched on demand at runtime and cached persistently under the user cache directory (`~/.px0/cache/vendor/`), keeping the compiled binary lean while still allowing diagrams to work offline after initial fetch and under `-base-path`.
+
+The adapter initializes Mermaid with `startOnLoad: false`, `securityLevel: strict`, disabled error rendering, and Mermaid's secure configuration keys. Diagram directives therefore cannot enable HTML labels, click callbacks, or a weaker security level. The returned `bindFunctions` hook is intentionally ignored.
+
+Rendering leverages an LRU diagram cache and cooperative event-loop yielding to optimize resource utilization and responsiveness. Every asynchronous continuation checks the preview generation and active document before changing the DOM. `drawPreview` waits for the batch before restoring a line, anchor, or saved scroll position. A syntax error affects only its fence: the original source remains visible and neighboring diagrams continue.
+
+The original `<pre>` stays in the DOM after a successful render, hidden from presentation and find but available to the existing copy button and `domToMarkdown`. This preserves exact Mermaid source when copying code or raw Markdown. Each rendered diagram owns a lightweight toolbar with controls for zooming (from 25% through 400%, with percentage label and fit-to-view), click-and-drag panning, and a full-screen toggle button. Full-screen mode maximizes the diagram into a focused overlay (`.md-mermaid.is-fullscreen`) centered across the entire viewport with locked page background scrolling, recalculating optimal fit while retaining zoom and pan. Dedicated close buttons in the controls toolbar and top-right corner, as well as `Esc`, cleanly dismiss full-screen view. `theme:changed` rerenders only the active preview after a short debounce, using the current px0 theme tokens.
 
 ## 6. Keeping the Reader's Place
 
@@ -234,7 +245,7 @@ Clicking the half that is already selected does nothing. The handler toggles onl
 
 The code view's features assume rows, so the preview substitutes its own versions:
 
-- Find (Ctrl+F). `runFind` in [`web/src/find.js`](../../web/src/find.js) calls `findInPreview(q)` instead of `/api/search`. It clears earlier `mark.md-hit` elements, then reuses `markNodes` from [`web/src/renderer.js`](../../web/src/renderer.js), the same text-node walker the code view uses, case-insensitively. `S.find.preview` routes `jumpToHit` to `showPreviewHit`, which scrolls the match to the middle when it is near an edge. Minimap ticks come from each mark's offset within `#mdview`'s scroll height.
+- Find (Ctrl+F). `runFind` in [`web/src/find.js`](../../web/src/find.js) calls `findInPreview(q, caseSensitive)` instead of `/api/search`. It clears earlier `mark.md-hit` elements, then reuses `markNodes` from [`web/src/renderer.js`](../../web/src/renderer.js), the same text-node walker the code view uses, case-insensitively unless the findbar Match case toggle (`#find-case`) is on. Hidden Mermaid source is excluded so matches correspond to visible content. `S.find.preview` routes `jumpToHit` to `showPreviewHit`, which scrolls the match to the middle when it is near an edge. Minimap ticks come from each mark's offset within `#mdview`'s scroll height.
 - Select all (Ctrl+A). `selectPreview()` selects the contents of `#md` natively instead of the whole-file `S.selAll` mode, so Ctrl+C copies the rendered text.
 - Scrolling. `previewKey(e)` maps ArrowUp and ArrowDown (and `k` / `j`) to 48 px, PageUp and PageDown to 90% of the view, and Home and End (Cmd+Up and Cmd+Down on macOS) to the ends. `shortcuts.js` calls it before the code view's caret handling.
 
@@ -242,9 +253,9 @@ Hover cards, Ctrl+click definitions and the selection bar listen on `#viewport`.
 
 ## 10. Limits and Known Gaps
 
-- Files over 4 MB are not previewed.
+- Markdown files over 4 MB are not previewed. CSV and TSV files show their first 1,000 rows or 1 MB (section 12).
 - Fences over 256 KB and fences without a language are not highlighted.
-- Mermaid diagrams and math render as code blocks.
+- Math fences render as code blocks.
 - The preview does not reload when the file changes on disk. Close and reopen the tab.
 - Images that load after a scroll position is restored can push content down.
 - Relative images in a Markdown file outside the workspace (opened through a language server) do not load, because `/api/raw` accepts only workspace paths.
@@ -257,4 +268,32 @@ Hover cards, Ctrl+click definitions and the selection bar listen on `#viewport`.
 - `TestMarkdownPreview` checks heading ids and `data-line`, highlighted fenced code, preserved relative links, task list checkboxes, the `markdown` flag on `/api/file`, and the 415 and 400 responses.
 - `TestHeadingIDsFollowGitHub` checks the id rules and deduplication.
 
-The sanitizer, link routing, position sync and switch run only in a browser and have no automated test in the repository.
+The sanitizer, Mermaid rendering, link routing, position sync and switch run only in a browser and have no automated test in the repository.
+
+## 12. Table Preview (CSV / TSV)
+
+CSV and TSV tabs reuse this overlay. `/api/file` returns `"table": true` for `.csv` and `.tsv`, the tab records `d.table`, and `previewKind(d)` returns `'markdown'`, `'table'` or `''`. `previewing(d)` reads `S.mdPreview` or `S.tablePreview` to match, so each kind keeps its own setting (`px0.mdPreview` / `px0.tablePreview` in localStorage, `markdown.preview.open` / `table.preview.open` in settings). Everything else in sections 6–9 (position sync, switch, find, select all, keys) is shared, because table rows carry `data-line` the same way Markdown blocks do.
+
+### Endpoint
+
+`GET /api/table?path=<path>` ([`table.go`](../../table.go)) resolves the path like `/api/markdown`, answers 415 for other extensions, and parses with `encoding/csv` (`LazyQuotes`, `FieldsPerRecord = -1`). `Comma` comes from `sniffDelim`: it peeks at the first 64 KB, takes the first non-blank line, and counts comma, tab, semicolon and pipe outside double quotes. The most frequent wins, and the extension's separator (`.csv` → comma, `.tsv` → tab) wins ties and files with none. Misnamed files are common: a tab-separated `.csv` read with commas comes out as one cell per line. The first record is the header, with a leading UTF-8 BOM removed. It returns:
+
+```json
+{ "header": ["repo", "files"], "headerLine": 1,
+  "rows": [{ "line": 2, "cells": ["linux", "81902"] }],
+  "cols": 2, "truncated": false }
+```
+
+`line` is `csv.Reader.FieldPos(0)`: the line the record's first cell starts on. Quoted cells that span lines and skipped blank lines therefore keep row numbers equal to source lines.
+
+### Caps
+
+`renderTable(r, size, fallback)` reads through `io.LimitReader(r, 1 MiB)` and stops after 1,000 data rows, so cost is bounded by the cap, not the file (a 50 MB file answers in well under a second). When the limit reader stops short of the end of the file (`size` over the cap), the last record may be cut in half: it is dropped and `truncated` is set. A parse error under the byte cap is ignored for the same reason. An error in a file read to its end returns 422.
+
+### Rendering
+
+`buildTable` ([`web/src/table.js`](../../web/src/table.js)) creates every cell with `textContent`. Nothing from the file is parsed as HTML, so the table needs no sanitizer. `drawPreview` sets the article's class to `csv` (the `.md` styles do not apply) and caches the rows in `d.tableData`. Cells use `white-space: pre-wrap` with `max-width: 48ch` and `overflow-wrap: break-word`, so long text wraps inside its column (checked in Chromium, WebKit and Firefox, which all honour `max-width` on cells of a `width: max-content` table). The header `th` cells and the `.ln` gutter are `position: sticky`; `mdGap()` returns the header row's height for tables, so `previewLine` places a row just under the pinned header instead of behind it. The header row is skipped as a scroll target (a line at or before it scrolls to the top), and `previewTopLine` returns the header's line while the table is unscrolled. `findInPreview` unwraps any match inside the `.ln` gutter or the footer, so counts and stepping cover cells only. The footer's **Open Source** button calls `togglePreview()`. It states the number of rows shown and the file's line count (`d.total`); counting rows in the whole file would mean parsing all of it.
+
+### Tests
+
+[`table_test.go`](../../table_test.go) holds the parsing rules (quoted comma and newline, line skipping, ragged rows, TSV, BOM, blank lines, stray quotes, empty file, row cap, exactly-at-cap), separator detection and ties, the endpoint and `table` flag, and the byte cap: an endless reader proves no more than 1 MiB is read and that the record the cap cuts through is dropped. The browser behaviour was checked with a headless Playwright run in Chromium, WebKit and Firefox; there is no browser test in the repository.

@@ -12,23 +12,30 @@ import (
 // are stored with the other per-user files px0 writes (~/.px0/settings.json),
 // never in the working tree.
 
+// settings stores user configuration written to ~/.px0/settings.json (or XDG_CONFIG_HOME/px0/settings.json).
+// All settings are optional pointers so omitted values fall back to application defaults.
 type settings struct {
 	Agent  string            `json:"agent,omitempty"`
 	Models map[string]string `json:"models,omitempty"`
 
-	EditorFontSize             *float64 `json:"editor.fontSize,omitempty"`
-	EditorFontFamily           *string  `json:"editor.fontFamily,omitempty"`
-	EditorLineHeight           *float64 `json:"editor.lineHeight,omitempty"`
-	EditorTabSize              *int     `json:"editor.tabSize,omitempty"`
-	EditorWordWrap             *string  `json:"editor.wordWrap,omitempty"`
-	EditorLineNumbers          *string  `json:"editor.lineNumbers,omitempty"`
-	EditorVimMode              *bool    `json:"editor.vimMode,omitempty"`
-	EditorRenderWhitespace     *string  `json:"editor.renderWhitespace,omitempty"`
-	EditorMinimapEnabled       *bool    `json:"editor.minimap.enabled,omitempty"`
-	WorkbenchColorTheme        *string  `json:"workbench.colorTheme,omitempty"`
-	DiffEditorRenderSideBySide *bool    `json:"diffEditor.renderSideBySide,omitempty"`
-	MarkdownPreviewOpen        *bool    `json:"markdown.preview.open,omitempty"`
-	TelemetryEnabled           *bool    `json:"telemetry.enabled,omitempty"`
+	EditorFontSize              *float64 `json:"editor.fontSize,omitempty"`
+	EditorFontFamily            *string  `json:"editor.fontFamily,omitempty"`
+	EditorLineHeight            *float64 `json:"editor.lineHeight,omitempty"`
+	EditorTabSize               *int     `json:"editor.tabSize,omitempty"`
+	EditorWordWrap              *string  `json:"editor.wordWrap,omitempty"`
+	EditorLineNumbers           *string  `json:"editor.lineNumbers,omitempty"`
+	EditorVimMode               *bool    `json:"editor.vimMode,omitempty"`
+	EditorRenderWhitespace      *string  `json:"editor.renderWhitespace,omitempty"`
+	EditorMinimapEnabled        *bool    `json:"editor.minimap.enabled,omitempty"`
+	WorkbenchColorTheme         *string  `json:"workbench.colorTheme,omitempty"`
+	DiffEditorRenderSideBySide  *bool    `json:"diffEditor.renderSideBySide,omitempty"`
+	MarkdownPreviewOpen         *bool    `json:"markdown.preview.open,omitempty"`
+	TablePreviewOpen            *bool    `json:"table.preview.open,omitempty"`
+	TelemetryEnabled            *bool    `json:"telemetry.enabled,omitempty"`
+	GitHubToken                 *string  `json:"github.token,omitempty"`
+	GitCommitMessageInstruction *string  `json:"git.commitMessageInstruction,omitempty"`
+	ServerBasePath              *string  `json:"server.basePath,omitempty"`
+	ExplorerAutoReveal          *bool    `json:"explorer.autoReveal,omitempty"`
 }
 
 var settingsMu sync.Mutex
@@ -46,6 +53,7 @@ func settingsPath() string {
 	return filepath.Join(home, ".px0", "settings.json")
 }
 
+// settingSchemaItem describes a configurable setting for dynamic rendering in the settings modal.
 type settingSchemaItem struct {
 	Key         string   `json:"key"`
 	Title       string   `json:"title"`
@@ -57,6 +65,7 @@ type settingSchemaItem struct {
 	Min         *float64 `json:"min,omitempty"`
 	Max         *float64 `json:"max,omitempty"`
 	Step        *float64 `json:"step,omitempty"`
+	Secret      bool     `json:"secret,omitempty"` // render as a masked input; still returned in plaintext by /api/settings, same trust model as every other local setting
 }
 
 func numPtr(v float64) *float64 { return &v }
@@ -150,42 +159,23 @@ var settingsSchema = []settingSchemaItem{
 		Description: "Specifies the color theme used in the workbench.",
 		Category:    "Workbench",
 		Type:        "select",
-		Default:     "github-dark",
+		Default:     "catppuccin-mocha",
 		Options: []string{
-			"github-dark", "dark", "light",
 			"catppuccin-mocha", "catppuccin-latte",
+			"github-dark", "dark", "light",
 			"dracula", "gruvbox-dark", "gruvbox-light",
 			"monokai", "nord", "one-dark", "rose-pine",
 			"solarized-dark", "solarized-light",
 		},
 	},
 	{
-		Key:         "workbench.sideBar.location",
-		Title:       "Sidebar Location",
-		Description: "Controls whether the file explorer appears on the left or right.",
+		Key:         "workbench.iconTheme",
+		Title:       "File Icon Theme",
+		Description: "Icons for files and folders: Material Icon Theme, or px0's minimal colour dots.",
 		Category:    "Workbench",
 		Type:        "select",
-		Default:     "left",
-		Options:     []string{"left", "right"},
-	},
-	{
-		Key:         "workbench.sideBar.width",
-		Title:       "Sidebar Width",
-		Description: "Controls the width of the file explorer in pixels.",
-		Category:    "Workbench",
-		Type:        "number",
-		Default:     228.0,
-		Min:         numPtr(170),
-		Max:         numPtr(620),
-		Step:        numPtr(1),
-	},
-	{
-		Key:         "workbench.sideBar.visible",
-		Title:       "Sidebar Visible",
-		Description: "Controls whether the file explorer is visible when px0 opens.",
-		Category:    "Workbench",
-		Type:        "boolean",
-		Default:     true,
+		Default:     "material",
+		Options:     []string{"material", "minimal"},
 	},
 	{
 		Key:         "diffEditor.renderSideBySide",
@@ -199,6 +189,14 @@ var settingsSchema = []settingSchemaItem{
 		Key:         "markdown.preview.open",
 		Title:       "Markdown Preview",
 		Description: "Controls whether Markdown files open in rendered preview by default.",
+		Category:    "Workbench",
+		Type:        "boolean",
+		Default:     true,
+	},
+	{
+		Key:         "table.preview.open",
+		Title:       "Table View",
+		Description: "Controls whether CSV and TSV files open as a table by default.",
 		Category:    "Workbench",
 		Type:        "boolean",
 		Default:     true,
@@ -264,7 +262,7 @@ var settingsSchema = []settingSchemaItem{
 	},
 	{
 		Key:         "explorer.autoReveal",
-		Title:       "Auto Reveal Active File",
+		Title:       "Auto Reveal",
 		Description: "Controls whether the file explorer automatically scrolls to and reveals active tabs.",
 		Category:    "Files & Explorer",
 		Type:        "boolean",
@@ -356,13 +354,39 @@ var settingsSchema = []settingSchemaItem{
 		Type:        "boolean",
 		Default:     false,
 	},
+	{
+		Key:         "git.commitMessageInstruction",
+		Title:       "Commit Message Instructions",
+		Description: "Extra instructions given to the coding harness when it writes a commit message for the staged diff (e.g. \"Follow Conventional Commits\" or \"Reference the ticket number in the branch name\").",
+		Category:    "Git & Diff",
+		Type:        "textarea",
+		Default:     "",
+	},
+	{
+		Key:         "github.token",
+		Title:       "GitHub Token",
+		Description: "Personal access token used to check out and review pull requests (px0 <url>). Takes precedence over the GITHUB_TOKEN environment variable and 'gh auth token'.",
+		Category:    "GitHub",
+		Type:        "string",
+		Default:     "",
+		Secret:      true,
+	},
+	{
+		Key:         "server.basePath",
+		Title:       "Base Path",
+		Description: "Base URL path prefix for the px0 server and web interface (e.g. /rev-123/).",
+		Category:    "Server",
+		Type:        "string",
+		Default:     "/",
+	},
 }
 
 func defaultSettingsMap() map[string]any {
-	res := make(map[string]any, len(settingsSchema)+2)
+	res := make(map[string]any, len(settingsSchema)+3)
 	for _, item := range settingsSchema {
 		res[item.Key] = item.Default
 	}
+	res["explorer.autoRelveal"] = true
 	res["agent"] = ""
 	res["models"] = map[string]string{}
 	return res
@@ -412,6 +436,14 @@ func readSettingsLocked() settings {
 			s.Agent = h
 		}
 	}
+	// Support server.basePath and basePath fallback
+	if s.ServerBasePath == nil {
+		if bp, ok := raw["server.basePath"].(string); ok && bp != "" {
+			s.ServerBasePath = &bp
+		} else if bp, ok := raw["basePath"].(string); ok && bp != "" {
+			s.ServerBasePath = &bp
+		}
+	}
 	// Bi-directional bridge between models <-> agent.models
 	if s.Models == nil || len(s.Models) == 0 {
 		if am, ok := raw["agent.models"].(map[string]any); ok {
@@ -421,6 +453,18 @@ func readSettingsLocked() settings {
 					s.Models[k] = vs
 				}
 			}
+		}
+	}
+	// Support explorer.autoReveal and explorer.autoRelveal
+	if s.ExplorerAutoReveal == nil {
+		if ar, ok := raw["explorer.autoReveal"].(bool); ok {
+			s.ExplorerAutoReveal = &ar
+		} else if ar, ok := raw["explorer.autoRelveal"].(bool); ok {
+			s.ExplorerAutoReveal = &ar
+		} else if ar, ok := raw["autoReveal"].(bool); ok {
+			s.ExplorerAutoReveal = &ar
+		} else if ar, ok := raw["autoRelveal"].(bool); ok {
+			s.ExplorerAutoReveal = &ar
 		}
 	}
 
@@ -451,6 +495,31 @@ func readMergedSettingsMap() map[string]any {
 		res["agent.models"] = m
 	} else if am, ok := raw["agent.models"].(map[string]any); ok && len(am) > 0 {
 		res["models"] = am
+	}
+
+	// Synchronize server.basePath / basePath
+	if bp, ok := raw["server.basePath"].(string); ok && bp != "" {
+		res["server.basePath"] = bp
+	} else if bp, ok := raw["basePath"].(string); ok && bp != "" {
+		res["server.basePath"] = bp
+	}
+
+	// Synchronize explorer.autoReveal / explorer.autoRelveal
+	if ar, ok := raw["explorer.autoReveal"].(bool); ok {
+		res["explorer.autoReveal"] = ar
+		res["explorer.autoRelveal"] = ar
+	} else if ar, ok := raw["explorer.autoRelveal"].(bool); ok {
+		res["explorer.autoReveal"] = ar
+		res["explorer.autoRelveal"] = ar
+	} else if ar, ok := raw["autoReveal"].(bool); ok {
+		res["explorer.autoReveal"] = ar
+		res["explorer.autoRelveal"] = ar
+	} else if ar, ok := raw["autoRelveal"].(bool); ok {
+		res["explorer.autoReveal"] = ar
+		res["explorer.autoRelveal"] = ar
+	} else {
+		res["explorer.autoReveal"] = true
+		res["explorer.autoRelveal"] = true
 	}
 
 	return res
@@ -552,6 +621,37 @@ func updateSettingsMap(updates map[string]any) error {
 				delete(raw, "models")
 			} else {
 				raw["models"] = v
+			}
+		}
+
+		// Keep server.basePath / basePath in sync
+		if k == "server.basePath" {
+			if v == nil || v == "" {
+				delete(raw, "server.basePath")
+				delete(raw, "basePath")
+			} else {
+				raw["server.basePath"] = v
+			}
+		} else if k == "basePath" {
+			if v == nil || v == "" {
+				delete(raw, "server.basePath")
+				delete(raw, "basePath")
+			} else {
+				raw["server.basePath"] = v
+				raw["basePath"] = v
+			}
+		}
+
+		// Keep explorer.autoReveal / explorer.autoRelveal in sync
+		if k == "explorer.autoReveal" || k == "explorer.autoRelveal" || k == "autoReveal" || k == "autoRelveal" {
+			if v == nil {
+				delete(raw, "explorer.autoReveal")
+				delete(raw, "explorer.autoRelveal")
+				delete(raw, "autoReveal")
+				delete(raw, "autoRelveal")
+			} else {
+				raw["explorer.autoReveal"] = v
+				raw["explorer.autoRelveal"] = v
 			}
 		}
 	}

@@ -115,8 +115,3 @@ Executing installation commands (e.g., `go install` or `npm install`) requires r
 1. The `Origin` header must exactly match the `Host` header.
 1. The `Host` header must resolve strictly to `127.0.0.1`, `[::1]`, or `localhost`.
 1. Commands are pulled strictly from the internal `lspRegistry`, and the client request cannot provide or modify the command string.
-
-
-## Workspace Shutdown
-
-The manager refuses starts/installs after closure, cancels pending initialization and installers, and joins admitted work. Live clients shut down concurrently: request protocol shutdown/exit, then kill their Unix process groups after a one-second grace period and join process exit. Installer contexts also use process-group cancellation and bounded pipe waits. Shell PATH discovery is asynchronous in the desktop app and triggers a rescan on completion.

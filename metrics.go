@@ -1,54 +1,32 @@
 package main
 
 import (
-	"math"
-	"runtime"
-	"sync"
-	"time"
+	"px0/internal/metrics"
 )
 
-type ProcessMetrics struct {
-	RSSBytes     uint64  `json:"rssBytes"`
-	RSSAvailable bool    `json:"rssAvailable"`
-	CPUUsage     float64 `json:"cpuUsage"`
-	CPUAvailable bool    `json:"cpuAvailable"`
-	Goroutine    int     `json:"goroutines"`
-}
+// ProcessMetrics captures system resource usage of the px0 server process
+// and any child language server processes. Re-exported from internal/metrics.
+type ProcessMetrics = metrics.ProcessMetrics
 
-type metricsCollector struct {
-	mu          sync.Mutex
-	lastSample  time.Time
-	lastCPUTime time.Duration
-	lastUsage   float64
-	hasUsage    bool
-}
+var (
+	readProcessRSS     = metrics.ReadProcessRSS
+	readRSSForPID      = metrics.ReadRSSForPID
+	readProcessCPUTime = metrics.ReadProcessCPUTime
+	getProcessRusage   = metrics.GetProcessRusage
+	globalMetrics      = metrics.DefaultCollector
+)
 
-var globalMetrics = &metricsCollector{}
-
-func getProcessMetrics() ProcessMetrics {
-	rss, err := readProcessRSS()
-	cpu, available := globalMetrics.sampleCPU()
-	return ProcessMetrics{RSSBytes: rss, RSSAvailable: err == nil,
-		CPUUsage: cpu, CPUAvailable: available, Goroutine: runtime.NumGoroutine()}
-}
-
-func (c *metricsCollector) sampleCPU() (float64, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	if !c.lastSample.IsZero() && now.Sub(c.lastSample) < 200*time.Millisecond {
-		return c.lastUsage, c.hasUsage
+// getProcessMetrics samples px0's own process stats, plus the combined
+// memory of any running language server processes when lsp is non-nil and
+// enabled (-no-lsp turns it off, but the manager itself is never nil).
+func getProcessMetrics(lsp *lspManager) ProcessMetrics {
+	var lspMem uint64
+	var lspEnabled bool
+	if lsp != nil {
+		lspEnabled = lsp.Enabled()
+		if lspEnabled {
+			lspMem = lsp.memBytes()
+		}
 	}
-	cpuTime, err := readProcessCPUTime()
-	if err != nil {
-		return 0, false
-	}
-	if c.lastSample.IsZero() {
-		c.lastSample, c.lastCPUTime = now, cpuTime
-		return 0, false
-	}
-	c.lastUsage = math.Max(0, float64(cpuTime-c.lastCPUTime)/float64(now.Sub(c.lastSample))*100)
-	c.lastSample, c.lastCPUTime = now, cpuTime
-	c.hasUsage = true
-	return c.lastUsage, true
+	return metrics.Collect(lspMem, lspEnabled)
 }
